@@ -1,35 +1,4 @@
-"""
-main.py
-───────
-Quizhub  — Full FastAPI application.
-
-Endpoints
-─────────
-Players
-  POST   /api/players/register
-  GET    /api/players/{wallet}
-
-Challenges
-  POST   /api/challenge/create            → AI generates questions, returns code
-  GET    /api/challenge/lobby             → open public challenges
-  GET    /api/challenge/{code}            → single challenge state
-  POST   /api/challenge/{code}/join       → stake + join
-  POST   /api/challenge/{code}/rematch    → request a rematch (new challenge, same players)
-  GET    /api/challenge/{wallet}/history  → past challenges for a wallet
-  GET    /api/challenge/{wallet}/pending-claims
-  POST   /api/challenge/claim             → manual reward claim
-
-Notifications
-  GET    /api/notifications/{wallet}          → paginated list
-  GET    /api/notifications/{wallet}/count    → unread badge count
-  POST   /api/notifications/{wallet}/read/{id}
-  POST   /api/notifications/{wallet}/read-all
-
-WebSockets
-  WS  /ws/challenge/{code}     → game events (questions, scores, chat)
-  WS  /ws/notify/{wallet}      → live notification push channel
-"""
-
+from __future__ import annotations
 from __future__ import annotations
 import os, json, random, string, asyncio, logging, uuid
 from typing import Dict, List, Optional
@@ -43,8 +12,14 @@ import asyncpg
 from supabase import create_client, Client
 from models import (
     CreateChallengeRequest, JoinChallengeRequest,
-    RematachRequest, ClaimRequest,UserProfile, SyncProfileRequest
+    RematachRequest, ClaimRequest,UserProfile, SyncProfileRequest, StakeOfferRequest
 )
+from abi import QUIZ_HUB_ABI
+import asyncio, logging
+from fastapi import HTTPException
+from pydantic import BaseModel
+ 
+logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Fail fast with a clear message if critical env vars are missing
@@ -70,6 +45,8 @@ app.add_middleware(
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+BACKEND_ADDRESS = os.getenv("BACKEN_ADDRESS")
+PRIVATE_KEY     = os.getenv("RESOLVER_PRIVATE_KEY")
 # ─── Config ──────────────────────────────────────────────────────────────────
 CONTRACT_ADDRESS = os.getenv("QUIZ_HUB_CONTRACT")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -86,7 +63,7 @@ challenges:  Dict[str, dict]         = {}  # code  → full challenge obj
 game_state:  Dict[str, dict]         = {}  # code  → { answers, current_round }
 connections: Dict[str, List[WebSocket]] = {}  # code  → [ws]  (game sockets)
 notify_conn: Dict[str, List[WebSocket]] = {}  # wallet → [ws] (notify sockets)
-
+offers:      Dict[str, dict]            = {}  
 pool: asyncpg.Pool = None
 notif: NotificationService = None
 
@@ -125,7 +102,34 @@ async def shutdown():
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
+async def update_stake_on_chain(code: str, agreed_amount: float) -> bool:
+    try:
+        w3 = Web3(Web3.HTTPProvider(RPC_URLS[42220]))
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(CONTRACT_ADDRESS),
+            abi=QUIZ_HUB_ABI  # include setStakePerPlayer
+        )
+        
+        quiz_id = Web3.keccak(text=code)
+        # Convert to wei / proper decimals if needed (assume amount is already in human units, adjust as per your token decimals)
+        tx = contract.functions.setStakePerPlayer(
+            quiz_id, 
+            int(agreed_amount * 10**18)  # adjust decimals based on token
+        ).build_transaction({
+            'from': BACKEND_ADDRESS,  # or resolver
+            'gas': 200000,
+            'nonce': w3.eth.get_transaction_count(BACKEND_ADDRESS),
+        })
+        
+        signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+        
+        return receipt.status == 1
+    except Exception as e:
+        logger.error(f"on-chain stake update failed: {e}")
+        return False
+    
 def make_code(k: int = 6) -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=k))
 
@@ -321,6 +325,233 @@ async def get_user_profile(wallet_address: str) -> Optional[UserProfile]:
     except Exception as e:
         print(f"Database error in get_user_profile: {str(e)}")
         return None
+@app.post("/api/challenge/{code}/offer")
+async def submit_offer(code: str, body: StakeOfferRequest):
+    """
+    Either player can propose a new stake amount.
+    - If no offer exists yet, this becomes the opening bid.
+    - If an offer already exists from the OTHER player, this is a counter.
+    - If both players independently call this with the SAME amount, it auto-accepts.
+    The backend broadcasts `stake_offer` to all lobby WS connections.
+    """
+    code   = code.upper()
+    wallet = body.walletAddress.lower()
+    amount = round(body.amount, 6)
+ 
+    if code not in challenges:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+ 
+    challenge = challenges[code]
+ 
+    if challenge["status"] != "waiting":
+        raise HTTPException(status_code=400, detail="Challenge is not in waiting state")
+ 
+    if wallet not in challenge["players"] and wallet != challenge["creator"]:
+        raise HTTPException(status_code=403, detail="You are not part of this challenge")
+ 
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Stake must be positive")
+ 
+    offer = offers.setdefault(code, {
+        "current":  challenge["stake"],   
+        "proposer": challenge["creator"],
+        "accepted": False,
+        "history":  [],
+    })
+    
+    
+ 
+    # Check auto-accept: last two history entries have the same amount from different wallets
+    history = offer["history"]
+    if (
+        len(history) >= 2
+        and history[-1]["amount"] == history[-2]["amount"]
+        and history[-1]["wallet"] != history[-2]["wallet"]
+    ):
+        offer["accepted"] = True
+        challenge["stake"] = amount           # lock agreed stake into challenge
+        await _persist_agreed_stake(code, amount)
+        await broadcast(code, {
+            "type":   "offer_accepted",
+            "amount": amount,
+            "by":     wallet,
+        })
+        return {"success": True, "accepted": True, "amount": amount}
+ 
+    await broadcast(code, {
+        "type":     "stake_offer",
+        "amount":   amount,
+        "proposer": wallet,
+        "username": challenge["players"].get(wallet, {}).get("username", wallet[:8]),
+        "history":  history,
+    })
+    if offer["accepted"]:
+        # 1. Persist to DB
+        await _persist_agreed_stake(code, amount)
+        
+        # 2. Trigger on-chain update
+        success = await update_stake_on_chain(code, amount)
+        if not success:
+            raise HTTPException(500, "Failed to update stake on-chain")
+        
+        # 3. Broadcast final agreement
+        await broadcast(code, {
+            "type": "offer_accepted",
+            "amount": amount,
+            "onChainUpdated": True
+        })
+    return {"success": True, "accepted": False, "amount": amount}
+ 
+    
+# ── HTTP endpoint 2: explicitly accept the current offer ──────────────────────
+ 
+@app.post("/api/challenge/{code}/accept-offer")
+async def accept_offer(code: str, body: StakeOfferRequest):
+    """
+    Explicitly accept whatever the current open offer is.
+    `body.amount` is ignored — we accept the stored `offers[code]["current"]`.
+    """
+    code   = code.upper()
+    wallet = body.walletAddress.lower()
+ 
+    if code not in challenges:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+ 
+    challenge = challenges[code]
+ 
+    if wallet not in challenge["players"] and wallet != challenge["creator"]:
+        raise HTTPException(status_code=403, detail="You are not part of this challenge")
+ 
+    offer = offers.get(code)
+    if not offer:
+        raise HTTPException(status_code=400, detail="No open offer to accept")
+    if offer["accepted"]:
+        raise HTTPException(status_code=400, detail="Already accepted")
+    if offer["proposer"] == wallet:
+        raise HTTPException(status_code=400, detail="Cannot accept your own offer — wait for the other player")
+ 
+    agreed_amount = offer["current"]
+    offer["accepted"] = True
+    challenge["stake"] = agreed_amount
+ 
+    await _persist_agreed_stake(code, agreed_amount)
+ 
+    await broadcast(code, {
+        "type":   "offer_accepted",
+        "amount": agreed_amount,
+        "by":     wallet,
+    })
+ 
+    return {"success": True, "accepted": True, "amount": agreed_amount}
+ 
+ 
+# ── DB helper ─────────────────────────────────────────────────────────────────
+ 
+async def _persist_agreed_stake(code: str, amount: float) -> None:
+    """Write the agreed stake back to ai_challenges so it survives restarts."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE ai_challenges SET stake_amount=$1 WHERE code=$2",
+            amount, code,
+        )
+ 
+ 
+
+ 
+async def _handle_ws_stake_offer(code: str, wallet: str, msg: dict) -> None:
+    """
+    Lightweight real-time relay of stake offers over WS.
+    The authoritative logic lives in the HTTP endpoint above; this just
+    rebroadcasts for clients that miss the HTTP response (e.g. reconnects).
+    """
+    amount = float(msg.get("amount", 0))
+    if amount <= 0 or code not in challenges:
+        return
+ 
+    offer = offers.get(code)
+    if not offer or offer["accepted"]:
+        return
+ 
+    # Only broadcast if this wallet can legitimately make offers
+    challenge = challenges[code]
+    if wallet not in challenge["players"] and wallet != challenge["creator"]:
+        return
+ 
+    await broadcast(code, {
+        "type":     "stake_offer",
+        "amount":   amount,
+        "proposer": wallet,
+        "username": challenge["players"].get(wallet, {}).get("username", wallet[:8]),
+        "history":  offer.get("history", []),
+    })
+ 
+ 
+async def _handle_ws_accept_offer(code: str, wallet: str) -> None:
+    """WS fast-path for accepting. Mirrors the HTTP endpoint logic."""
+    if code not in challenges:
+        return
+ 
+    offer = offers.get(code)
+    if not offer or offer["accepted"] or offer["proposer"] == wallet:
+        return
+ 
+    agreed_amount        = offer["current"]
+    offer["accepted"]    = True
+    challenges[code]["stake"] = agreed_amount
+ 
+    asyncio.create_task(_persist_agreed_stake(code, agreed_amount))
+ 
+    await broadcast(code, {
+        "type":   "offer_accepted",
+        "amount": agreed_amount,
+        "by":     wallet,
+    })
+ 
+# main.py - New Endpoint
+@app.post("/api/challenge/{code}/accept-final")
+async def accept_final(code: str, body: dict):
+    code = code.upper()
+    # 1. Update DB state to 'agreed'
+    async with pool.acquire() as conn:
+        challenge = await conn.fetchrow("SELECT * FROM ai_challenges WHERE code=$1", code)
+        
+    # 2. TRIGGER BLOCKCHAIN (Relayer Pattern)
+    # This calls the setStakePerPlayer function on your QuizHub contract
+    try:
+        success = await trigger_contract_update(
+            code, 
+            challenge['stake_amount'], 
+            challenge['token_symbol']
+        )
+        if success:
+            # 3. Notify BOTH players to enter lobby
+            await broadcast(code, {"type": "stake_locked_on_chain", "amount": challenge['stake_amount']})
+            return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def trigger_contract_update(code, amount, token):
+    # Standard Web3.py logic to send transaction
+    w3 = Web3(Web3.HTTPProvider(RPC_URLS))
+    account = w3.eth.account.from_key(os.getenv("RELAYER_PRIVATE_KEY"))
+    
+    contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=QUIZ_HUB_ABI)
+    quiz_id = w3.keccak(text=code)
+    
+    # Convert amount to Wei
+    amount_wei = w3.to_wei(amount, 'ether') # Adjust based on token decimals
+    
+    tx = contract.functions.setStakePerPlayer(quiz_id, amount_wei).build_transaction({
+        'from': account.address,
+        'nonce': w3.eth.get_transaction_count(account.address),
+        'gas': 2000000,
+        'gasPrice': w3.eth.gas_price
+    })
+    
+    signed_tx = w3.eth.account.sign_transaction(tx, private_key=account.private_key)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    return receipt.status == 1
     
 @app.get("/api/players/{wallet}")
 async def get_player(wallet: str):

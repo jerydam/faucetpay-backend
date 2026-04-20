@@ -77,7 +77,10 @@ class ChallengePublic(BaseModel):
     isPublic: bool
     players: Dict[str, PlayerState]
 
-
+class StakeOfferRequest(BaseModel):
+    walletAddress: str
+    amount: float     
+    
 class LobbyEntry(BaseModel):
     code: str
     topic: str
