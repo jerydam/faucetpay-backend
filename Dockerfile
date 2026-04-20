@@ -20,4 +20,4 @@ RUN pip install --upgrade pip && \
 # Copy project files
 COPY . .
 
-CMD uvicorn src.main:app --host 0.0.0.0 --port ${PORT}
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT}
