@@ -381,89 +381,32 @@ async def submit_offer(code: str, body: StakeOfferRequest):
         raise HTTPException(status_code=404, detail="Challenge not found")
 
     challenge = challenges[code]
+    
+    # 1. REMOVE THE GLOBAL LOCK
+    # Instead of checking a single 'challenger', we just store this specific player's offer
+    if "player_offers" not in challenge:
+        challenge["player_offers"] = {}
 
-    if challenge["status"] != "waiting":
-        raise HTTPException(status_code=400, detail="Challenge is not in waiting state")
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="Stake must be positive")
-
-    offer = offers.setdefault(code, {
-        "current":    challenge["stake"],
-        "proposer":   challenge["creator"],
-        "accepted":   False,
-        "history":    [],
-        "challenger": None,
-    })
-
-    if offer["accepted"]:
-        raise HTTPException(status_code=400, detail="Stake already agreed")
-
-    creator    = challenge["creator"]
-    challenger = offer["challenger"]
-
-    if wallet == creator:
-        pass
-    elif challenger is None:
-        offer["challenger"] = wallet
-        challenger = wallet
-    elif wallet == challenger:
-        pass
-    else:
-        raise HTTPException(
-            status_code=403,
-            detail="Another negotiation is already in progress for this challenge"
-        )
-
-    history = offer["history"]
-
-    # Idempotent: ignore exact duplicate from same wallet
-    if history and history[-1]["wallet"] == wallet and history[-1]["amount"] == amount:
-        return {"success": True, "accepted": False, "amount": amount}
+    # Store/Update this specific player's bid
+    challenge["player_offers"][wallet] = amount
 
     username = (
-        challenge["players"].get(wallet, {}).get("username")
-        or getattr(body, "username", None)
-        or wallet[:8]
+        challenge["players"].get(wallet, {}).get("username") 
+        or getattr(body, "username", "Anon")
     )
 
-    history.append({"wallet": wallet, "amount": amount, "username": username})
-    offer["current"]  = amount
-    offer["proposer"] = wallet
-
-    # Auto-accept: two consecutive entries match in amount, different wallets
-    if (
-        len(history) >= 2
-        and history[-1]["amount"] == history[-2]["amount"]
-        and history[-1]["wallet"] != history[-2]["wallet"]
-    ):
-        offer["accepted"]        = True
-        challenge["agreedStake"] = amount
-        challenge["stake"]       = amount
-        await _persist_agreed_stake(code, amount)
-
-        asyncio.create_task(_call_set_stake_on_chain(code, amount, challenge))
-
-        await broadcast(code, {
-            "type":       "offer_accepted",
-            "amount":     amount,
-            "by":         wallet,
-            "winner":     challenger,       # frontend checks msg.winner
-            "challenger": challenger,
-        })
-        return {"success": True, "accepted": True, "amount": amount}
-
-    # Normal counter-offer — broadcast as "pre_lobby_offer" so the pre-lobby page receives it
+    # 2. BROADCAST TO EVERYONE
+    # This allows the Creator to see all offers in the UI simultaneously
     await broadcast(code, {
         "type":      "pre_lobby_offer",
         "wallet":    wallet,
         "amount":    amount,
         "username":  username,
         "sentAt":    datetime.datetime.utcnow().isoformat(),
-        "history":   history,
-        "isCreator": wallet == creator,
+        "isCreator": wallet == challenge["creator"].lower()
     })
-    return {"success": True, "accepted": False, "amount": amount}
 
+    return {"success": True, "amount": amount}
 
 @app.post("/api/challenge/{code}/accept-offer")
 async def accept_offer(code: str, body: StakeOfferRequest):
@@ -1289,6 +1232,7 @@ async def notify_socket(ws: WebSocket, wallet: str):
 def _safe_challenge(c: dict) -> dict:
     import copy
     safe       = copy.deepcopy(c)
+    safe["player_offers"] = c.get("player_offers", {})
     safe_rounds = strip_answers({"rounds": safe.get("rounds", [])})
     safe["rounds"] = safe_rounds["rounds"]
     if "agreedStake" not in safe:
