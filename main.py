@@ -1197,7 +1197,7 @@ async def _maybe_auto_start(code: str) -> None:
         wallets = list(c["players"].keys())
         asyncio.create_task(notif.notify_game_starting(code, wallets))
         asyncio.create_task(
-            run_game_loop(code, challenges, game_state, pool, broadcast)
+            run_game_loop(code, challenges, game_state, pool, broadcast, notif)
         )
 
 
