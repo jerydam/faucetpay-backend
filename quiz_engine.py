@@ -130,18 +130,20 @@ async def _call_groq(prompt: str) -> dict:
         return json.loads(text)
 
 
-async def generate_questions(topic: str) -> dict:
+async def generate_questions(topic: str, total_count: int = 15) -> dict:
     """
-    Calls Gemini to produce 3 rounds × 3 questions, falls back to Groq on failure.
-    Returns: { "rounds": [ {type, timeLimit, questions:[...]}, ... ] }
+    total_count:  15... up to 30.
     """
+    per_round = total_count // 3
+    
     prompt = f"""
 Generate a 1v1 quiz challenge about "{topic}".
-Create exactly 9 multiple-choice questions divided into 3 rounds:
-- Round 1 (Easy):   3 questions — straightforward recall.
-- Round 2 (Medium): 3 questions — requires understanding.
-- Round 3 (Hard):   3 questions — tricky, nuanced, or analytical.
-Return ONLY valid JSON — no markdown fences, no commentary:
+Create exactly {total_count} multiple-choice questions divided into 3 rounds:
+- Round 1 (Easy):   {per_round} questions — straightforward recall.
+- Round 2 (Medium): {per_round} questions — requires understanding.
+- Round 3 (Hard):   {per_round} questions — tricky, nuanced, or analytical.
+
+Return ONLY valid JSON:
 {{
   "rounds": [
     {{ "type": "easy",   "timeLimit": 7,  "questions": [ ... ] }},
