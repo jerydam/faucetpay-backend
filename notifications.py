@@ -7,37 +7,31 @@ Two delivery mechanisms:
   1. DB-backed persistence  → clients poll GET /api/notifications/{wallet}
   2. Live push via WebSocket → if the target wallet has an open /ws/notify/{wallet}
                                connection the message is sent immediately
-
-Usage:
-    from notifications import NotificationService
-    notif = NotificationService(pool, notify_connections)
-    await notif.send(recipient, type_, title, body, data)
 """
 from __future__ import annotations
 import json, logging
 from typing import Dict, List, Optional, Any
 from fastapi import WebSocket
-
 import asyncpg
 
 logger = logging.getLogger(__name__)
 
-# Notification types ─ matches CHECK constraint in schema.sql
+
 class NType:
-    PUBLIC_CHALLENGE  = "public_challenge"
-    CHALLENGE_INVITE  = "challenge_invite"
-    PLAYER_JOINED     = "player_joined"
-    GAME_STARTING     = "game_starting"
-    GAME_OVER         = "game_over"
-    REMATCH_REQUEST   = "rematch_request"
-    REWARD_AVAILABLE  = "reward_available"
+    PUBLIC_CHALLENGE = "public_challenge"
+    CHALLENGE_INVITE = "challenge_invite"
+    PLAYER_JOINED    = "player_joined"
+    GAME_STARTING    = "game_starting"
+    GAME_OVER        = "game_over"
+    REMATCH_REQUEST  = "rematch_request"
+    REWARD_AVAILABLE = "reward_available"
 
 
 class NotificationService:
     def __init__(
         self,
         pool: asyncpg.Pool,
-        live_connections: Dict[str, List[WebSocket]],   # wallet → [ws]
+        live_connections: Dict[str, List[WebSocket]],
     ):
         self.pool  = pool
         self.conns = live_connections
@@ -75,7 +69,6 @@ class NotificationService:
             "createdAt": row["created_at"].isoformat(),
         }
 
-        # Push live if wallet has an open notify socket
         await self._push(recipient, payload)
         return notif_id
 
@@ -94,35 +87,72 @@ class NotificationService:
 
     # ─── Convenience helpers ─────────────────────────────────────────────────
 
-    async def notify_public_challenge(self, code: str, topic: str, creator: str, stake: float, token: str) -> None:
-        """
-        Fan out to ALL registered players (except creator) that a new public
-        challenge is available. In production, paginate this query.
-        """
+    async def notify_public_challenge(
+        self,
+        code: str,
+        topic: str,
+        creator: str,
+        stake: float,
+        token: str,
+        creator_username: str = "",
+    ) -> None:
+        display_name = creator_username or creator[:8]
+
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT wallet_address FROM players WHERE wallet_address != $1",
                 creator.lower(),
             )
+
+        logger.info(
+            "notify_public_challenge: code=%s  recipients=%d  creator=%s",
+            code, len(rows), creator,
+        )
+
         for row in rows:
             await self.send(
                 row["wallet_address"],
                 NType.PUBLIC_CHALLENGE,
                 "🎯 New Public Challenge",
-                f'{creator} is challenging everyone on "{topic}" — stake {stake} {token}!',
-                {"code": code, "topic": topic},
+                f'{display_name} is challenging everyone on "{topic}" — stake {stake} {token}!',
+                {
+                    "code":        code,
+                    "topic":       topic,
+                    "stake":       stake,
+                    "token":       token,
+                    "creatorName": display_name,
+                },
             )
 
-    async def notify_friend_invite(self, code: str, topic: str, from_username: str, to_wallet: str, stake: float, token: str) -> None:
+    async def notify_friend_invite(
+        self,
+        code: str,
+        topic: str,
+        from_username: str,
+        to_wallet: str,
+        stake: float,
+        token: str,
+    ) -> None:
         await self.send(
             to_wallet,
             NType.CHALLENGE_INVITE,
             f"⚔️ {from_username} challenged you!",
             f'You\'ve been invited to a "{topic}" quiz. Stake: {stake} {token}. Use code {code}.',
-            {"code": code, "topic": topic},
+            {
+                "code":        code,
+                "topic":       topic,
+                "stake":       stake,
+                "token":       token,
+                "creatorName": from_username,
+            },
         )
 
-    async def notify_player_joined(self, code: str, joiner_username: str, creator_wallet: str) -> None:
+    async def notify_player_joined(
+        self,
+        code: str,
+        joiner_username: str,
+        creator_wallet: str,
+    ) -> None:
         await self.send(
             creator_wallet,
             NType.PLAYER_JOINED,
@@ -141,7 +171,14 @@ class NotificationService:
                 {"code": code},
             )
 
-    async def notify_game_over(self, code: str, winner_wallet: str, loser_wallet: str, stake: float, token: str) -> None:
+    async def notify_game_over(
+        self,
+        code: str,
+        winner_wallet: str,
+        loser_wallet: str,
+        stake: float,
+        token: str,
+    ) -> None:
         await self.send(
             winner_wallet,
             NType.REWARD_AVAILABLE,
@@ -157,7 +194,12 @@ class NotificationService:
             {"code": code},
         )
 
-    async def notify_rematch_request(self, code: str, requester_username: str, opponent_wallet: str) -> None:
+    async def notify_rematch_request(
+        self,
+        code: str,
+        requester_username: str,
+        opponent_wallet: str,
+    ) -> None:
         await self.send(
             opponent_wallet,
             NType.REMATCH_REQUEST,
@@ -166,7 +208,7 @@ class NotificationService:
             {"code": code},
         )
 
-    # ─── DB Reads ─────────────────────────────────────────────────────────────
+    # ─── DB reads ─────────────────────────────────────────────────────────────
 
     async def get_unread(self, wallet: str, limit: int = 20) -> list:
         async with self.pool.acquire() as conn:
@@ -201,7 +243,7 @@ class NotificationService:
                 wallet.lower(),
             )
 
-    # ─── Internal ─────────────────────────────────────────────────────────────
+    # ─── Internal push ────────────────────────────────────────────────────────
 
     async def _push(self, wallet: str, payload: dict) -> None:
         sockets = self.conns.get(wallet, [])
@@ -216,11 +258,10 @@ class NotificationService:
 
 
 def _row_to_dict(row) -> dict:
-    d = dict(row)
+    d          = dict(row)
     d["id"]        = str(d["id"])
     d["createdAt"] = d.pop("created_at").isoformat()
     d["isRead"]    = d.pop("is_read")
     if d["data"] and isinstance(d["data"], str):
-        import json as _json
-        d["data"] = _json.loads(d["data"])
+        d["data"] = json.loads(d["data"])
     return d

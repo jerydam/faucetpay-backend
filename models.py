@@ -79,7 +79,8 @@ class ChallengePublic(BaseModel):
 
 class StakeOfferRequest(BaseModel):
     walletAddress: str
-    amount: float     
+    amount: float   
+    username: Optional[str] = None  
     
 class LobbyEntry(BaseModel):
     code: str

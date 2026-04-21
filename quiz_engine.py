@@ -28,6 +28,8 @@ import asyncpg
 from web3 import Web3
 from eth_account import Account
 
+from notifications import NotificationService
+
 logger = logging.getLogger(__name__)
 
 # ─── Gemini config ────────────────────────────────────────────────────────────
@@ -37,7 +39,9 @@ GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta"
     "/models/gemini-2.5-flash:generateContent"
 )
-
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL   = "llama-3.3-70b-versatile"
 # ─── On-chain config ──────────────────────────────────────────────────────────
 
 RESOLVER_PRIVATE_KEY = os.getenv("RESOLVER_PRIVATE_KEY", "")
@@ -81,36 +85,8 @@ SPEED_BONUS = 500   # max extra for answering instantly
 
 # ─── AI Question Generation ───────────────────────────────────────────────────
 
-async def generate_questions(topic: str) -> dict:
-    """
-    Calls Gemini to produce 3 rounds × 3 questions.
-    Returns: { "rounds": [ {type, timeLimit, questions:[...]}, ... ] }
-    Each question: { "question": str, "options": [{id, text}], "correctId": str }
-    """
-    prompt = f"""
-Generate a 1v1 quiz challenge about "{topic}".
-Create exactly 9 multiple-choice questions divided into 3 rounds:
-- Round 1 (Easy):   3 questions — straightforward recall.
-- Round 2 (Medium): 3 questions — requires understanding.
-- Round 3 (Hard):   3 questions — tricky, nuanced, or analytical.
-
-Return ONLY valid JSON — no markdown fences, no commentary:
-{{
-  "rounds": [
-    {{ "type": "easy",   "timeLimit": 7,  "questions": [ ... ] }},
-    {{ "type": "medium", "timeLimit": 10, "questions": [ ... ] }},
-    {{ "type": "hard",   "timeLimit": 13, "questions": [ ... ] }}
-  ]
-}}
-
-Each question object must follow this exact shape:
-{{
-  "question": "Question text here?",
-  "options":  [ {{"id":"A","text":"..."}}, {{"id":"B","text":"..."}},
-                {{"id":"C","text":"..."}}, {{"id":"D","text":"..."}} ],
-  "correctId": "A"
-}}
-"""
+async def _call_gemini(prompt: str) -> dict:
+    """Call Gemini and return parsed rounds dict. Raises on any error."""
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             f"{GEMINI_URL}?key={GEMINI_API_KEY}",
@@ -122,15 +98,94 @@ Each question object must follow this exact shape:
         resp.raise_for_status()
         raw  = resp.json()
         text = raw["candidates"][0]["content"]["parts"][0]["text"]
-        data = json.loads(text)
+        return json.loads(text)
 
-    # Enforce ROUND_CONFIG time limits regardless of what AI returned
+
+async def _call_groq(prompt: str) -> dict:
+    """Call Groq (OpenAI-compatible) and return parsed rounds dict. Raises on any error."""
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {
+                        "role":    "system",
+                        "content": "You are a quiz generator. Return ONLY valid JSON, no markdown fences.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.7,
+            },
+        )
+        resp.raise_for_status()
+        raw  = resp.json()
+        text = raw["choices"][0]["message"]["content"]
+        # Strip accidental markdown fences just in case
+        text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        return json.loads(text)
+
+
+async def generate_questions(topic: str) -> dict:
+    """
+    Calls Gemini to produce 3 rounds × 3 questions, falls back to Groq on failure.
+    Returns: { "rounds": [ {type, timeLimit, questions:[...]}, ... ] }
+    """
+    prompt = f"""
+Generate a 1v1 quiz challenge about "{topic}".
+Create exactly 9 multiple-choice questions divided into 3 rounds:
+- Round 1 (Easy):   3 questions — straightforward recall.
+- Round 2 (Medium): 3 questions — requires understanding.
+- Round 3 (Hard):   3 questions — tricky, nuanced, or analytical.
+Return ONLY valid JSON — no markdown fences, no commentary:
+{{
+  "rounds": [
+    {{ "type": "easy",   "timeLimit": 7,  "questions": [ ... ] }},
+    {{ "type": "medium", "timeLimit": 10, "questions": [ ... ] }},
+    {{ "type": "hard",   "timeLimit": 13, "questions": [ ... ] }}
+  ]
+}}
+Each question object must follow this exact shape:
+{{
+  "question": "Question text here?",
+  "options":  [ {{"id":"A","text":"..."}}, {{"id":"B","text":"..."}},
+                {{"id":"C","text":"..."}}, {{"id":"D","text":"..."}} ],
+  "correctId": "A"
+}}
+"""
+    data = None
+
+    # ── Try Gemini ────────────────────────────────────────────────────────────
+    if GEMINI_API_KEY:
+        try:
+            logger.info("generate_questions: trying Gemini...")
+            data = await _call_gemini(prompt)
+            logger.info("generate_questions: Gemini succeeded.")
+        except Exception as e:
+            logger.warning("generate_questions: Gemini failed (%s), falling back to Groq.", e)
+
+    # ── Fallback: Groq ────────────────────────────────────────────────────────
+    if data is None:
+        if not GROQ_API_KEY:
+            raise RuntimeError("Gemini unavailable and GROQ_API_KEY is not set — cannot generate questions.")
+        try:
+            logger.info("generate_questions: trying Groq fallback...")
+            data = await _call_groq(prompt)
+            logger.info("generate_questions: Groq succeeded.")
+        except Exception as e:
+            logger.error("generate_questions: Groq also failed: %s", e)
+            raise RuntimeError(f"Both Gemini and Groq failed. Last error: {e}") from e
+
+    # ── Enforce round config regardless of which provider answered ────────────
     for i, rnd in enumerate(data["rounds"]):
         rnd["timeLimit"] = ROUND_CONFIG[i]["timeLimit"]
         rnd["type"]      = ROUND_CONFIG[i]["type"]
 
     return data
-
 
 def strip_answers(rounds_data: dict) -> dict:
     """
@@ -264,6 +319,7 @@ async def run_game_loop(
     game_state: Dict[str, dict],
     pool:       asyncpg.Pool,
     broadcast:  BroadcastFn,
+    notif:      "NotificationService",   # ← add this
 ) -> None:
     """
     Drives a full match:
@@ -375,7 +431,25 @@ async def run_game_loop(
         # Tie → refundQuiz → both players can call emergencyRefund() from the frontend
         asyncio.create_task(_refund_quiz_on_chain(code))
 
-    # ── Notify players ────────────────────────────────────────────────────────
+    stake = challenge.get("stakeAmount", 0)
+    token = challenge.get("tokenSymbol", "")
+
+    if outcome == "winner" and winner:
+        loser = next(w for w in wallets if w != winner)
+        # Persists to DB inbox AND pushes live if connected
+        await notif.notify_game_over(code, winner, loser, stake, token)
+    else:
+        # Tie — notify both
+        for wallet in wallets:
+            await notif.send(
+                wallet,
+                "game_over",
+                "🤝 It's a tie!",
+                "The match ended in a draw. Both stakes will be refunded.",
+                {"code": code},
+            )
+
+    # WebSocket broadcast for the live game UI (keep this too)
     final_payload = {
         "type":    "game_over",
         "outcome": outcome,
