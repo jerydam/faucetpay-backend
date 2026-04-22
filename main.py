@@ -974,28 +974,116 @@ async def join_challenge(code: str, body: JoinChallengeRequest):
     return {"success": True, "challenge": _safe_challenge(challenge)}
 
 
-@app.post("/api/challenge/{code}/rematch")
-async def request_rematch(code: str, body: RematachRequest):
+@app.post("/api/challenge/{code}/rematch-invite")
+async def send_rematch_invite(code: str, body: dict):
+    """
+    Lightweight invite — no challenge created yet.
+    Just pushes a WS event to the opponent so they see the popup.
+    Body: { requesterWallet: str }
+    """
     code      = code.upper()
-    requester = body.requesterWallet.lower()
-
-    if code not in challenges:
+    requester = body.get("requesterWallet", "").lower()
+ 
+    if not requester:
+        raise HTTPException(status_code=400, detail="requesterWallet required")
+ 
+    # Load original challenge for metadata
+    if code in challenges:
+        c       = challenges[code]
+        topic   = c["topic"]
+        stake   = c["stake"]
+        token   = c["token"]
+        players = {w: p["username"] for w, p in c["players"].items()}
+    else:
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM ai_challenges WHERE code=$1", code)
         if not row:
-            raise HTTPException(status_code=404, detail="Original challenge not found")
-        orig = dict(row)
-        topic, stake, token, chain_id, orig_id = (
-            orig["topic"], float(orig["stake_amount"]),
-            orig["token_symbol"], orig["chain_id"], str(orig["id"]),
-        )
+            raise HTTPException(status_code=404, detail="Challenge not found")
+        d = dict(row)
+        topic = d["topic"]
+        stake = float(d["stake_amount"])
+        token = d["token_symbol"]
         async with pool.acquire() as conn:
-            player_rows = await conn.fetch(
+            prows = await conn.fetch(
                 "SELECT wallet_address, username FROM challenge_players WHERE challenge_id=$1",
-                orig["id"],
+                d["id"],
             )
-        players = {r["wallet_address"]: r["username"] for r in player_rows}
-    else:
+        players = {r["wallet_address"]: r["username"] for r in prows}
+ 
+    if requester not in players:
+        raise HTTPException(status_code=403, detail="You were not part of this challenge")
+ 
+    requester_name  = players[requester]
+    opponent_wallet = next((w for w in players if w != requester), None)
+    if not opponent_wallet:
+        raise HTTPException(status_code=400, detail="Cannot find opponent")
+ 
+    # Push invite to opponent's notify socket
+    await broadcast(code, {
+        "type":            "rematch_invite",
+        "originalCode":    code,
+        "topic":           topic,
+        "stakeAmount":     stake,
+        "tokenSymbol":     token,
+        "requesterWallet": requester,
+        "requesterName":   requester_name,
+    })
+    return {"success": True, "opponentWallet": opponent_wallet}
+        
+ 
+ 
+# ── STEP 2: Opponent accepts invite ──────────────────────────────────────────
+ 
+@app.post("/api/challenge/{code}/rematch-accept-invite")
+async def accept_rematch_invite(code: str, body: dict):
+    """
+    Opponent clicks Accept. No on-chain tx.
+    Notifies the requester so they can proceed with createQuiz.
+    Body: { acceptorWallet: str, requesterWallet: str }
+    """
+    code             = code.upper()
+    acceptor         = body.get("acceptorWallet",  "").lower()
+    requester_wallet = body.get("requesterWallet", "").lower()
+ 
+    if not acceptor or not requester_wallet:
+        raise HTTPException(
+            status_code=400,
+            detail="acceptorWallet and requesterWallet required",
+        )
+ 
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT username FROM players WHERE wallet_address=$1", acceptor
+        )
+    acceptor_name = row["username"] if row else f"User{acceptor[-4:].upper()}"
+ 
+    # Notify requester — they now call handleRematchRequest()
+    await broadcast(code, {
+        "type":           "rematch_invite_accepted",
+        "originalCode":   code,
+        "acceptorWallet": acceptor,
+        "acceptorName":   acceptor_name,
+    })
+    return {"success": True}
+ 
+ 
+# ── STEP 3: Requester creates challenge (after invite accepted + on-chain) ────
+ 
+@app.post("/api/challenge/{code}/rematch")
+async def request_rematch(code: str, body: RematachRequest):
+    """
+    Called by REQUESTER after:
+      a) opponent accepted the invite
+      b) requester signed createQuiz on-chain
+ 
+    Creates DB record + generates questions. Opponent is set as the private
+    inviteWallet so only they can enter. Pushes "rematch_ready" to opponent
+    so they auto-route to pre-lobby without signing anything.
+    """
+    code      = code.upper()
+    requester = body.requesterWallet.lower()
+ 
+    if code in challenges:
         c        = challenges[code]
         topic    = c["topic"]
         stake    = c["stake"]
@@ -1003,31 +1091,49 @@ async def request_rematch(code: str, body: RematachRequest):
         chain_id = c["chainId"]
         orig_id  = c["id"]
         players  = {w: p["username"] for w, p in c["players"].items()}
-
+    else:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM ai_challenges WHERE code=$1", code)
+        if not row:
+            raise HTTPException(status_code=404, detail="Original challenge not found")
+        d        = dict(row)
+        topic    = d["topic"]
+        stake    = float(d["stake_amount"])
+        token    = d["token_symbol"]
+        chain_id = d["chain_id"]
+        orig_id  = str(d["id"])
+        async with pool.acquire() as conn:
+            prows = await conn.fetch(
+                "SELECT wallet_address, username FROM challenge_players WHERE challenge_id=$1",
+                d["id"],
+            )
+        players = {r["wallet_address"]: r["username"] for r in prows}
+ 
     if requester not in players:
         raise HTTPException(status_code=403, detail="You were not part of this challenge")
-
+ 
     requester_username = players[requester]
     opponent_wallet    = next((w for w in players if w != requester), None)
     if not opponent_wallet:
         raise HTTPException(status_code=400, detail="Cannot find opponent")
-
+ 
     questions_data = await generate_questions(topic)
     new_code       = make_code()
     new_id         = str(uuid.uuid4())
-
+ 
     new_challenge = {
-        "id":          new_id,
-        "code":        new_code,
-        "topic":       topic,
-        "creator":     requester,
-        "creatorName": requester_username,
-        "stake":       stake,
-        "token":       token,
-        "chainId":     chain_id,
-        "rounds":      questions_data["rounds"],
-        "status":      "waiting",
-        "isPublic":    False,
+        "id":           new_id,
+        "code":         new_code,
+        "topic":        topic,
+        "creator":      requester,
+        "creatorName":  requester_username,
+        "stake":        stake,
+        "token":        token,
+        "chainId":      chain_id,
+        "rounds":       questions_data["rounds"],
+        "status":       "waiting",
+        "isPublic":     False,
+        "inviteWallet": opponent_wallet,  # private — only this opponent can enter
         "players": {
             requester: {
                 "username":   requester_username,
@@ -1037,7 +1143,7 @@ async def request_rematch(code: str, body: RematachRequest):
             }
         },
     }
-
+ 
     async with pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO ai_challenges
@@ -1051,15 +1157,26 @@ async def request_rematch(code: str, body: RematachRequest):
             "INSERT INTO challenge_players (challenge_id, wallet_address, username) VALUES ($1,$2,$3)",
             new_id, requester, requester_username,
         )
-
+ 
     challenges[new_code] = new_challenge
     game_state[new_code] = {"answers": {}}
-
-    asyncio.create_task(
-        notif.notify_rematch_request(new_code, requester_username, opponent_wallet)
-    )
-
-    return {"success": True, "newCode": new_code, "challenge": _safe_challenge(new_challenge)}
+ 
+    # Push "rematch_ready" to opponent — just navigate, no tx required
+    await broadcast(code, {
+        "type":            "rematch_ready",
+        "newCode":         new_code,
+        "topic":           topic,
+        "stakeAmount":     stake,
+        "tokenSymbol":     token,
+        "requesterWallet": requester,       # <-- add this
+        "requesterName":   requester_username,
+    })
+    return {
+        "success":        True,
+        "newCode":        new_code,
+        "opponentWallet": opponent_wallet,
+        "challenge":      _safe_challenge(new_challenge),
+    }
 
 
 @app.post("/api/challenge/{code}/sync-stake")
