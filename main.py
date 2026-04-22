@@ -10,11 +10,15 @@ import httpx
 import asyncpg
 from supabase import create_client, Client
 from models import (
-    CreateChallengeRequest, JoinChallengeRequest,
-    RematachRequest, ClaimRequest, UserProfile, SyncProfileRequest, StakeOfferRequest
+    CheckAvailabilityRequest, CreateChallengeRequest, JoinChallengeRequest,
+    RematachRequest, ClaimRequest, UpdateProfileRequest, UserProfile, SyncProfileRequest, StakeOfferRequest
 )
 from abi import QUIZ_HUB_ABI
 from eth_account import Account
+import re
+from pydantic import BaseModel
+
+
 
 logger = logging.getLogger(__name__)
 load_dotenv()
@@ -666,7 +670,153 @@ async def get_user_profile_endpoint(wallet_address: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get user profile: {str(e)}")
 
-
+_USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
+ 
+def _validate_username(username: str) -> Optional[str]:
+    """Returns an error message string, or None if valid."""
+    if len(username) < 3:
+        return "Username must be at least 3 characters"
+    if len(username) > 24:
+        return "Username must be 24 characters or fewer"
+    if not _USERNAME_RE.match(username):
+        return "Letters, numbers, and underscores only"
+    return None
+ 
+# SQL fragment — always return the same columns so callers are consistent
+_PROFILE_COLS = """
+    wallet_address,
+    username,
+    COALESCE(avatar_url, '') AS avatar_url,
+    COALESCE(bio,        '') AS bio,
+    COALESCE(email,      '') AS email,
+    COALESCE(phone,      '') AS phone
+"""
+ 
+ 
+# ── GET /api/profile/{wallet} ─────────────────────────────────────────────────
+ 
+@app.get("/api/profile/{wallet}")
+async def get_profile_by_wallet(wallet: str):
+    """
+    Returns a player's profile by wallet address.
+    Called by ProfileSettingsModal on open and by DashboardPage.
+    Returns profile: null (not 404) for unknown wallets so the frontend
+    can handle brand-new users gracefully.
+    """
+    wallet = wallet.lower()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT {_PROFILE_COLS} FROM players WHERE wallet_address = $1",
+            wallet,
+        )
+    return {"success": True, "profile": dict(row) if row else None}
+ 
+ 
+# ── GET /api/profile/user/{username} ─────────────────────────────────────────
+ 
+@app.get("/api/profile/user/{username}")
+async def get_profile_by_username(username: str):
+    """
+    Looks up a profile by username (case-insensitive).
+    Used for /dashboard/<username> routes.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT {_PROFILE_COLS} FROM players WHERE LOWER(username) = LOWER($1)",
+            username,
+        )
+    if not row:
+        return {"success": False, "profile": None}
+    return {"success": True, "profile": dict(row)}
+ 
+ 
+# ── POST /api/profile/update ──────────────────────────────────────────────────
+ 
+@app.post("/api/profile/update")
+async def update_profile(body: UpdateProfileRequest):
+    """
+    Creates or updates a player profile.
+    Called by ProfileSettingsModal on save.
+    """
+    wallet   = body.wallet_address.lower()
+    username = body.username.strip()
+ 
+    if not wallet:
+        raise HTTPException(status_code=400, detail="wallet_address is required")
+    if not username:
+        raise HTTPException(status_code=400, detail="username is required")
+ 
+    err = _validate_username(username)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+ 
+    async with pool.acquire() as conn:
+        # Uniqueness check — allow the wallet to keep its own current username
+        conflict = await conn.fetchrow(
+            """SELECT wallet_address FROM players
+               WHERE LOWER(username) = LOWER($1)
+                 AND wallet_address  != $2""",
+            username, wallet,
+        )
+        if conflict:
+            raise HTTPException(status_code=409, detail="Username is already taken")
+ 
+        # Upsert and return the saved row
+        row = await conn.fetchrow(
+            f"""INSERT INTO players
+                    (wallet_address, username, avatar_url, bio, email, phone, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, now())
+                ON CONFLICT (wallet_address) DO UPDATE
+                    SET username   = EXCLUDED.username,
+                        avatar_url = EXCLUDED.avatar_url,
+                        bio        = EXCLUDED.bio,
+                        email      = EXCLUDED.email,
+                        phone      = EXCLUDED.phone,
+                        updated_at = now()
+                RETURNING {_PROFILE_COLS}""",
+            wallet,
+            username,
+            body.avatar_url or "",
+            body.bio        or "",
+            body.email      or "",
+            body.phone      or "",
+        )
+ 
+    return {"success": True, "profile": dict(row)}
+ 
+ 
+# ── POST /api/profile/check-availability ─────────────────────────────────────
+ 
+@app.post("/api/profile/check-availability")
+async def check_availability(body: CheckAvailabilityRequest):
+    """
+    Real-time username availability check — called on input blur in
+    ProfileSettingsModal. Returns { available: bool, message: str }.
+    """
+    value  = body.value.strip()
+    wallet = body.current_wallet.lower()
+ 
+    # Only username uniqueness is stored in players
+    if body.field.lower() != "username":
+        return {"available": True, "message": "Available"}
+ 
+    err = _validate_username(value)
+    if err:
+        return {"available": False, "message": err}
+ 
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT wallet_address FROM players
+               WHERE LOWER(username) = LOWER($1)
+                 AND wallet_address  != $2""",
+            value, wallet,
+        )
+ 
+    if row:
+        return {"available": False, "message": "Username is already taken"}
+    return {"available": True, "message": "Available"}
+ 
+ 
 @app.post("/api/users")
 async def create_user_profile_endpoint(profile: UserProfile):
     try:
@@ -1177,11 +1327,16 @@ def _handle_submit_answer(code: str, wallet: str, msg: dict) -> None:
     q_idx = msg.get("questionIndex")
     key   = f"{r_idx}_{q_idx}"
     state = game_state[code]
-    if wallet not in state["answers"].get(key, {}):
-        state["answers"].setdefault(key, {})[wallet] = {
-            "answerId":  msg.get("answerId"),
-            "timeTaken": msg.get("timeTaken", 0),
-        }
+
+    # Initialize the question key if it doesn't exist
+    if key not in state["answers"]:
+        state["answers"][key] = {}
+
+    # Overwrite the answer (this allows the user to change their mind)
+    state["answers"][key][wallet] = {
+        "answerId":  msg.get("answerId"),
+        "timeTaken": msg.get("timeTaken", 0),
+    }
 
 
 async def _maybe_auto_start(code: str) -> None:

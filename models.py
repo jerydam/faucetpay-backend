@@ -111,3 +111,29 @@ class NotificationOut(BaseModel):
     data: Optional[Dict[str, Any]] = None
     isRead: bool
     createdAt: str
+class UpdateProfileRequest(BaseModel):
+    wallet_address: str
+    username:       str
+    avatar_url:     Optional[str] = ""
+    bio:            Optional[str] = ""
+    email:          Optional[str] = ""
+    phone:          Optional[str] = ""
+    # Kept for ProfileSettingsModal schema compat — not used server-side
+    signature:        Optional[str] = ""
+    message:          Optional[str] = ""
+    nonce:            Optional[str] = ""
+    solana_address:   Optional[str] = ""
+    twitter_handle:   Optional[str] = ""
+    discord_handle:   Optional[str] = ""
+    telegram_handle:  Optional[str] = ""
+    farcaster_handle: Optional[str] = ""
+    twitter_id:       Optional[str] = ""
+    discord_id:       Optional[str] = ""
+    telegram_user_id: Optional[str] = ""
+    farcaster_id:     Optional[str] = ""
+ 
+ 
+class CheckAvailabilityRequest(BaseModel):
+    field:          str    # only "username" is enforced
+    value:          str
+    current_wallet: str
