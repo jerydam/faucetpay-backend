@@ -109,8 +109,11 @@ async def startup():
         server_settings={"application_name": "quizhub_backend"},
     )
     notif = NotificationService(pool, notify_conn)
-    logger.info("🚀 Quiz Platform Started")
 
+    # ── Start nightly rank snapshot ──
+    asyncio.create_task(_nightly_snapshot_loop())
+
+    logger.info("🚀 Quiz Platform Started")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -976,18 +979,12 @@ async def join_challenge(code: str, body: JoinChallengeRequest):
 
 @app.post("/api/challenge/{code}/rematch-invite")
 async def send_rematch_invite(code: str, body: dict):
-    """
-    Lightweight invite — no challenge created yet.
-    Just pushes a WS event to the opponent so they see the popup.
-    Body: { requesterWallet: str }
-    """
     code      = code.upper()
     requester = body.get("requesterWallet", "").lower()
- 
+
     if not requester:
         raise HTTPException(status_code=400, detail="requesterWallet required")
- 
-    # Load original challenge for metadata
+
     if code in challenges:
         c       = challenges[code]
         topic   = c["topic"]
@@ -1009,16 +1006,15 @@ async def send_rematch_invite(code: str, body: dict):
                 d["id"],
             )
         players = {r["wallet_address"]: r["username"] for r in prows}
- 
+
     if requester not in players:
         raise HTTPException(status_code=403, detail="You were not part of this challenge")
- 
+
     requester_name  = players[requester]
     opponent_wallet = next((w for w in players if w != requester), None)
     if not opponent_wallet:
         raise HTTPException(status_code=400, detail="Cannot find opponent")
- 
-    # Push invite to opponent's notify socket
+
     await broadcast(code, {
         "type":            "rematch_invite",
         "originalCode":    code,
@@ -1028,8 +1024,27 @@ async def send_rematch_invite(code: str, body: dict):
         "requesterWallet": requester,
         "requesterName":   requester_name,
     })
-    return {"success": True, "opponentWallet": opponent_wallet}
-        
+
+    # ── Schedule timeout broadcast after 30 seconds ──
+    async def _rematch_timeout():
+        await asyncio.sleep(30)
+        # Only fire timeout if the rematch was never accepted
+        # (check if a new challenge was created from this code)
+        already_rematched = any(
+            c.get("rematch_of") == code or
+            challenges.get(c_code, {}).get("rematch_of") == code
+            for c_code, c in list(challenges.items())
+        )
+        if not already_rematched:
+            await broadcast(code, {
+                "type":            "rematch_timeout",
+                "requesterWallet": requester,
+                "message":         "Rematch request expired — opponent did not respond.",
+            })
+
+    asyncio.create_task(_rematch_timeout())
+
+    return {"success": True, "opponentWallet": opponent_wallet}    
  
  
 # ── STEP 2: Opponent accepts invite ──────────────────────────────────────────
@@ -1318,6 +1333,108 @@ async def claim_win(body: ClaimRequest):
         "amount":  float(row["stake_amount"]) * 2,
     }
 
+# ─── Ranks Endpoint ───────────────────────────────────────────────────────────
+
+# ─── Ranks ────────────────────────────────────────────────────────────────────
+
+async def _take_rank_snapshot() -> None:
+    """Save every player's current rank position to rank_snapshots for today."""
+    async with pool.acquire() as conn:
+        # Get today's ranking
+        rows = await conn.fetch(
+            """SELECT wallet_address
+               FROM players
+               WHERE COALESCE(total_duels, 0) > 0
+               ORDER BY total_wins DESC, total_duels DESC"""
+        )
+        if not rows:
+            return
+
+        today = __import__("datetime").date.today()
+
+        # Upsert today's snapshot
+        await conn.executemany(
+            """INSERT INTO rank_snapshots (wallet_address, rank_position, snapshotted_at)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (wallet_address, snapshotted_at) DO UPDATE
+                   SET rank_position = EXCLUDED.rank_position""",
+            [(row["wallet_address"], idx + 1, today) for idx, row in enumerate(rows)],
+        )
+    logger.info("Rank snapshot taken — %d players", len(rows))
+
+
+async def _nightly_snapshot_loop() -> None:
+    """Background task: takes a snapshot once per day at midnight UTC."""
+    import datetime
+    while True:
+        now       = datetime.datetime.utcnow()
+        tomorrow  = (now + datetime.timedelta(days=1)).replace(
+            hour=0, minute=0, second=5, microsecond=0
+        )
+        wait_secs = (tomorrow - now).total_seconds()
+        logger.info("Next rank snapshot in %.0f seconds", wait_secs)
+        await asyncio.sleep(wait_secs)
+        try:
+            await _take_rank_snapshot()
+        except Exception as e:
+            logger.error("Nightly snapshot failed: %s", e)
+
+
+@app.get("/api/ranks")
+async def get_ranks(limit: int = Query(default=100, le=200)):
+    """
+    Returns all players ranked by total_wins desc, with rank_delta
+    showing position change since yesterday's snapshot.
+    """
+    import datetime
+    today     = datetime.date.today()
+    yesterday = today - datetime.timedelta(days=1)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                p.wallet_address,
+                COALESCE(p.username, 'Anonymous')   AS username,
+                COALESCE(p.avatar_url, '')           AS avatar_url,
+                COALESCE(p.total_wins,   0)          AS total_wins,
+                COALESCE(p.total_duels,  0)          AS total_duels,
+                COALESCE(p.total_earned, 0.0)        AS total_earned,
+                -- yesterday's position (NULL if new player)
+                ys.rank_position                     AS yesterday_rank
+            FROM players p
+            LEFT JOIN rank_snapshots ys
+                ON ys.wallet_address  = p.wallet_address
+               AND ys.snapshotted_at  = $1
+            WHERE COALESCE(p.total_duels, 0) > 0
+            ORDER BY p.total_wins DESC, p.total_duels DESC
+            LIMIT $2
+            """,
+            yesterday, limit,
+        )
+
+    players = []
+    for today_rank, row in enumerate(rows, start=1):
+        d             = dict(row)
+        yesterday_pos = d.pop("yesterday_rank")  # remove raw field
+
+        if yesterday_pos is None:
+            rank_delta = 0   # new player — no movement to show
+        else:
+            # positive = moved UP (was higher number, now lower)
+            rank_delta = yesterday_pos - today_rank
+
+        d["rank_delta"] = rank_delta
+        players.append(d)
+
+    return {"success": True, "players": players}
+
+
+@app.post("/api/ranks/snapshot")
+async def trigger_snapshot():
+    """Manual trigger for taking a rank snapshot (admin / cron use)."""
+    await _take_rank_snapshot()
+    return {"success": True, "message": "Snapshot taken"}
 
 # ─── Notification Endpoints ───────────────────────────────────────────────────
 
@@ -1345,6 +1462,31 @@ async def mark_all_read(wallet: str):
     return {"success": True}
 
 
+@app.post("/api/challenge/{code}/rematch-decline")
+async def decline_rematch_invite(code: str, body: dict):
+    """
+    Opponent declines the rematch invite.
+    Body: { declinerWallet: str, requesterWallet: str }
+    """
+    code             = code.upper()
+    decliner         = body.get("declinerWallet",  "").lower()
+    requester_wallet = body.get("requesterWallet", "").lower()
+
+    if not decliner:
+        raise HTTPException(status_code=400, detail="declinerWallet required")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT username FROM players WHERE wallet_address=$1", decliner
+        )
+    decliner_name = row["username"] if row else f"User{decliner[-4:].upper()}"
+
+    await broadcast(code, {
+        "type":          "rematch_declined",
+        "declinerWallet": decliner,
+        "declinerName":   decliner_name,
+    })
+    return {"success": True}
 # ─── WebSocket: Game ──────────────────────────────────────────────────────────
 
 @app.websocket("/ws/challenge/{code}")
@@ -1352,6 +1494,9 @@ async def challenge_socket(ws: WebSocket, code: str):
     code = code.upper()
     await ws.accept()
     connections.setdefault(code, []).append(ws)
+
+    # Identify the connecting wallet from the first message
+    connected_wallet = None
 
     if code in challenges:
         await ws.send_json({
@@ -1363,6 +1508,10 @@ async def challenge_socket(ws: WebSocket, code: str):
         async for msg in ws.iter_json():
             m_type = msg.get("type")
             wallet = msg.get("walletAddress", "").lower()
+
+            # ── Track who owns this socket ──
+            if wallet and not connected_wallet:
+                connected_wallet = wallet
 
             if m_type == "stake_confirmed":
                 await _handle_stake_confirmed(code, wallet, msg.get("txHash", ""))
@@ -1387,6 +1536,19 @@ async def challenge_socket(ws: WebSocket, code: str):
         sockets = connections.get(code, [])
         if ws in sockets:
             sockets.remove(ws)
+
+        # ── Notify remaining players that this wallet left ──
+        if connected_wallet and code in challenges:
+            challenge = challenges[code]
+            player    = challenge["players"].get(connected_wallet, {})
+            username  = player.get("username") or f"User{connected_wallet[-4:].upper()}"
+
+            await broadcast(code, {
+                "type":     "player_left",
+                "wallet":   connected_wallet,
+                "username": username,
+                "message":  f"{username} has left the game.",
+            })
 
 
 async def _handle_stake_confirmed(code: str, wallet: str, tx_hash: str) -> None:
