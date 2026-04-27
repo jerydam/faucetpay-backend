@@ -477,7 +477,23 @@ async def _mark_started(pool: asyncpg.Pool, code: str) -> None:
             "UPDATE ai_challenges SET status='active', started_at=NOW() WHERE code=$1",
             code,
         )
-
+async def _update_player_stats(pool, winner: str, loser: str) -> None:
+    """Increment total_duels for both players, total_wins for winner only."""
+    async with pool.acquire() as conn:
+        # Both players played one duel
+        await conn.execute(
+            "UPDATE players SET total_duels = COALESCE(total_duels, 0) + 1 WHERE wallet_address = $1",
+            winner,
+        )
+        await conn.execute(
+            "UPDATE players SET total_duels = COALESCE(total_duels, 0) + 1 WHERE wallet_address = $1",
+            loser,
+        )
+        # Only winner gets a win
+        await conn.execute(
+            "UPDATE players SET total_wins = COALESCE(total_wins, 0) + 1 WHERE wallet_address = $1",
+            winner,
+        )
 
 async def _mark_finished(pool: asyncpg.Pool, code: str, winner: str | None) -> None:
     async with pool.acquire() as conn:
@@ -487,22 +503,33 @@ async def _mark_finished(pool: asyncpg.Pool, code: str, winner: str | None) -> N
                WHERE code=$2""",
             winner, code,
         )
+        # Increment total_duels for ALL players — COALESCE guards against NULL
+        await conn.execute(
+            """UPDATE players SET total_duels = COALESCE(total_duels, 0) + 1
+               WHERE wallet_address IN (
+                   SELECT wallet_address FROM challenge_players
+                   WHERE challenge_id = (SELECT id FROM ai_challenges WHERE code = $1)
+               )""",
+            code,
+        )
         if winner:
             await conn.execute(
-                "UPDATE players SET total_wins=total_wins+1 WHERE wallet_address=$1",
+                """UPDATE players
+                   SET total_wins = COALESCE(total_wins, 0) + 1
+                   WHERE wallet_address = $1""",
                 winner,
             )
             await conn.execute(
-                """UPDATE players SET total_losses=total_losses+1
+                """UPDATE players
+                   SET total_losses = COALESCE(total_losses, 0) + 1
                    WHERE wallet_address IN (
                        SELECT wallet_address FROM challenge_players
-                       WHERE challenge_id=(SELECT id FROM ai_challenges WHERE code=$1)
+                       WHERE challenge_id = (SELECT id FROM ai_challenges WHERE code = $1)
                          AND wallet_address != $2
                    )""",
                 code, winner,
             )
-
-
+            
 async def _save_answer(
     pool:       asyncpg.Pool,
     code:       str,

@@ -13,6 +13,7 @@ from models import (
     CheckAvailabilityRequest, CreateChallengeRequest, JoinChallengeRequest,
     RematachRequest, ClaimRequest, UpdateProfileRequest, UserProfile, SyncProfileRequest, StakeOfferRequest
 )
+from quiz_engine import (_mark_finished, _set_winner_on_chain)
 from abi import QUIZ_HUB_ABI
 from eth_account import Account
 import re
@@ -348,30 +349,6 @@ async def create_challenge(body: CreateChallengeRequest):
 
     challenges[code] = challenge_obj
     game_state[code] = {"answers": {}}
-
-    # 4. Notifications — FIXED: correct if/elif structure
-    if body.isPublic:
-        asyncio.create_task(
-            notif.notify_public_challenge(
-                code,
-                body.topic,
-                creator_low,
-                body.stakeAmount,
-                body.tokenSymbol,
-                creator_username=body.creatorUsername,
-            )
-        )
-    elif body.inviteWallet:
-        asyncio.create_task(
-            notif.notify_friend_invite(
-                code,
-                body.topic,
-                body.creatorUsername,
-                body.inviteWallet,
-                body.stakeAmount,
-                body.tokenSymbol,
-            )
-        )
 
     return {"success": True, "code": code, "challenge": _safe_challenge(challenge_obj)}
 
@@ -846,45 +823,6 @@ async def get_lobby(
     return {"success": True, "challenges": [dict(r) for r in rows]}
 
 
-@app.get("/api/challenge/{code}")
-async def get_challenge(code: str):
-    code = code.upper()
-    if code in challenges:
-        return {"success": True, "challenge": _safe_challenge(challenges[code])}
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM ai_challenges WHERE code=$1", code)
-        if not row:
-            raise HTTPException(status_code=404, detail="Challenge not found")
-
-        d = dict(row)
-        d["stake"]    = float(d.get("stake_amount", 0))
-        d["token"]    = d.get("token_symbol", "")
-        d["chainId"]  = d.get("chain_id")
-        d["isPublic"] = d.get("is_public")
-        d["creator"]  = d.get("creator_address", "")
-
-        creator_row = await conn.fetchrow(
-            "SELECT username FROM players WHERE wallet_address=$1", d["creator"]
-        )
-        d["creatorName"] = creator_row["username"] if creator_row else d["creator"][:8]
-
-        player_rows = await conn.fetch(
-            """SELECT wallet_address, username, tx_verified, ready
-               FROM challenge_players WHERE challenge_id=$1""",
-            d["id"],
-        )
-        d["players"] = {
-            r["wallet_address"]: {
-                "username":   r["username"],
-                "points":     0,
-                "ready":      r["ready"],
-                "txVerified": r["tx_verified"],
-            }
-            for r in player_rows
-        }
-
-    return {"success": True, "challenge": d}
 
 
 @app.post("/api/challenge/{code}/join")
@@ -944,6 +882,10 @@ async def join_challenge(code: str, body: JoinChallengeRequest):
     if joiner in challenge["players"]:
         return {"success": True, "challenge": _safe_challenge(challenge)}
 
+    # ── FIX: only mark tx_verified if it's a real on-chain hash ──
+    FAKE_HASHES = {"pre-lobby-agreed", "sync-recovery", "auto-sync", "", None}
+    tx_verified = body.txHash not in FAKE_HASHES
+
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO players (wallet_address, username) VALUES ($1,$2) ON CONFLICT DO NOTHING",
@@ -952,17 +894,17 @@ async def join_challenge(code: str, body: JoinChallengeRequest):
         await conn.execute(
             """INSERT INTO challenge_players
                 (challenge_id, wallet_address, username, tx_hash, tx_verified)
-               VALUES ((SELECT id FROM ai_challenges WHERE code=$1), $2, $3, $4, TRUE)
+               VALUES ((SELECT id FROM ai_challenges WHERE code=$1), $2, $3, $4, $5)
                ON CONFLICT (challenge_id, wallet_address)
-               DO UPDATE SET tx_hash=$4, tx_verified=TRUE""",
-            code, joiner, body.username, body.txHash,
+               DO UPDATE SET tx_hash=$4, tx_verified=$5""",
+            code, joiner, body.username, body.txHash, tx_verified,
         )
 
     challenge["players"][joiner] = {
         "username":   body.username,
         "points":     0,
         "ready":      False,
-        "txVerified": True,
+        "txVerified": tx_verified,   # ← was hardcoded True
     }
 
     asyncio.create_task(
@@ -1304,6 +1246,45 @@ async def get_pending_claims(wallet: str):
         )
     return {"success": True, "claims": [dict(r) for r in rows]}
 
+@app.get("/api/challenge/{code}")
+async def get_challenge(code: str):
+    code = code.upper()
+    if code in challenges:
+        return {"success": True, "challenge": _safe_challenge(challenges[code])}
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM ai_challenges WHERE code=$1", code)
+        if not row:
+            raise HTTPException(status_code=404, detail="Challenge not found")
+
+        d = dict(row)
+        d["stake"]    = float(d.get("stake_amount", 0))
+        d["token"]    = d.get("token_symbol", "")
+        d["chainId"]  = d.get("chain_id")
+        d["isPublic"] = d.get("is_public")
+        d["creator"]  = d.get("creator_address", "")
+
+        creator_row = await conn.fetchrow(
+            "SELECT username FROM players WHERE wallet_address=$1", d["creator"]
+        )
+        d["creatorName"] = creator_row["username"] if creator_row else d["creator"][:8]
+
+        player_rows = await conn.fetch(
+            """SELECT wallet_address, username, tx_verified, ready
+               FROM challenge_players WHERE challenge_id=$1""",
+            d["id"],
+        )
+        d["players"] = {
+            r["wallet_address"]: {
+                "username":   r["username"],
+                "points":     0,
+                "ready":      r["ready"],
+                "txVerified": r["tx_verified"],
+            }
+            for r in player_rows
+        }
+
+    return {"success": True, "challenge": d}
 
 @app.post("/api/challenge/claim")
 async def claim_win(body: ClaimRequest):
@@ -1336,7 +1317,6 @@ async def claim_win(body: ClaimRequest):
 # ─── Ranks Endpoint ───────────────────────────────────────────────────────────
 
 # ─── Ranks ────────────────────────────────────────────────────────────────────
-
 async def _take_rank_snapshot() -> None:
     """Save every player's current rank position to rank_snapshots for today."""
     async with pool.acquire() as conn:
@@ -1379,6 +1359,17 @@ async def _nightly_snapshot_loop() -> None:
         except Exception as e:
             logger.error("Nightly snapshot failed: %s", e)
 
+@app.get("/api/players/by-username/{username}")
+async def get_player_by_username(username: str):
+    """Resolve a username to wallet address. Used by private invite flow."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT wallet_address, username FROM players WHERE LOWER(username) = LOWER($1)",
+            username.strip(),
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return {"success": True, "wallet": row["wallet_address"], "username": row["username"]}
 
 @app.get("/api/ranks")
 async def get_ranks(limit: int = Query(default=100, le=200)):
@@ -1495,7 +1486,6 @@ async def challenge_socket(ws: WebSocket, code: str):
     await ws.accept()
     connections.setdefault(code, []).append(ws)
 
-    # Identify the connecting wallet from the first message
     connected_wallet = None
 
     if code in challenges:
@@ -1509,9 +1499,14 @@ async def challenge_socket(ws: WebSocket, code: str):
             m_type = msg.get("type")
             wallet = msg.get("walletAddress", "").lower()
 
-            # ── Track who owns this socket ──
             if wallet and not connected_wallet:
                 connected_wallet = wallet
+
+            # ── FIX: mark reconnect so grace timer cancels cleanly ──
+            if wallet and wallet in (challenges.get(code, {}).get("players") or {}):
+                if game_state.get(code):
+                    game_state[code].pop(f"disconnected_{wallet}", None)
+                    game_state[code][f"reconnected_{wallet}"] = True
 
             if m_type == "stake_confirmed":
                 await _handle_stake_confirmed(code, wallet, msg.get("txHash", ""))
@@ -1537,19 +1532,159 @@ async def challenge_socket(ws: WebSocket, code: str):
         if ws in sockets:
             sockets.remove(ws)
 
-        # ── Notify remaining players that this wallet left ──
         if connected_wallet and code in challenges:
             challenge = challenges[code]
             player    = challenge["players"].get(connected_wallet, {})
             username  = player.get("username") or f"User{connected_wallet[-4:].upper()}"
 
             await broadcast(code, {
-                "type":     "player_left",
-                "wallet":   connected_wallet,
-                "username": username,
-                "message":  f"{username} has left the game.",
+                "type":         "player_left",
+                "wallet":       connected_wallet,
+                "username":     username,
+                "message":      f"{username} has left the game.",
+                "isActiveGame": challenge.get("status") == "active",
             })
 
+            if challenge.get("status") == "active":
+                asyncio.create_task(
+                    _disconnect_grace(code, connected_wallet, username)
+                )
+
+
+GRACE_SECONDS = 60
+
+async def _disconnect_grace(code: str, wallet: str, username: str) -> None:
+    """
+    Grace period: gives disconnected player GRACE_SECONDS to reconnect.
+    If they don't, the opponent wins by forfeit.
+    The game continues normally for the connected player during this time.
+    """
+    # Mark as disconnected so we can track reconnect
+    if game_state.get(code):
+        game_state[code][f"disconnected_{wallet}"] = True
+
+    for elapsed in range(GRACE_SECONDS):
+        await asyncio.sleep(1)
+
+        # ── Player reconnected? ──
+        if game_state.get(code, {}).get(f"reconnected_{wallet}"):
+            game_state[code].pop(f"reconnected_{wallet}", None)
+            game_state[code].pop(f"disconnected_{wallet}", None)
+            await broadcast(code, {
+                "type":     "player_rejoined",
+                "wallet":   wallet,
+                "username": username,
+            })
+            return
+
+        # ── Game ended by other means ──
+        if code not in challenges or challenges[code].get("status") != "active":
+            return
+
+        seconds_left = GRACE_SECONDS - elapsed - 1
+        if seconds_left % 10 == 0 or seconds_left <= 5:
+            await broadcast(code, {
+                "type":        "reconnect_countdown",
+                "wallet":      wallet,
+                "username":    username,
+                "secondsLeft": seconds_left,
+            })
+
+    # ── Grace period expired — forfeit ──
+    if code not in challenges or challenges[code].get("status") != "active":
+        return
+
+    challenge = challenges[code]
+    players   = challenge["players"]
+    winner    = next((w for w in players if w.lower() != wallet.lower()), None)
+
+    if not winner:
+        return
+
+    challenge["status"] = "finished"
+    challenge["winner"] = winner
+    await _mark_finished(pool, code, winner)
+    asyncio.create_task(_set_winner_on_chain(code, winner))
+
+    stake = challenge.get("stake", 0)
+    token = challenge.get("token", "")
+    await notif.notify_game_over(code, winner, wallet, stake, token)
+
+    await broadcast(code, {
+        "type":        "game_over",
+        "outcome":     "winner",
+        "winner":      winner,
+        "reason":      "forfeit",
+        "forfeitedBy": wallet,
+        "finalScores": {
+            w: {"username": p["username"], "points": p["points"]}
+            for w, p in players.items()
+        },
+        "canRematch": True,
+    })
+    logger.info("Forfeit: %s disconnected, %s wins  code=%s", wallet, winner, code)
+
+    
+
+@app.post("/api/challenge/{code}/on-chain-confirmed")
+async def on_chain_confirmed(code: str, body: dict):
+    """
+    Called by the frontend AFTER createQuiz tx is confirmed on-chain.
+    Only now do we notify other players — the challenge is truly live.
+    Body: { creatorWallet: str, txHash: str }
+    """
+    code           = code.upper()
+    creator_wallet = body.get("creatorWallet", "").lower()
+    tx_hash        = body.get("txHash", "")
+
+    if code not in challenges:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+
+    challenge = challenges[code]
+
+    # Guard: only the creator can confirm
+    if challenge["creator"].lower() != creator_wallet:
+        raise HTTPException(status_code=403, detail="Not the creator")
+
+    # Idempotency — don't double-notify if called twice
+    if challenge.get("onChainConfirmed"):
+        return {"success": True, "alreadyConfirmed": True}
+
+    challenge["onChainConfirmed"] = True
+    challenge["txHash"]           = tx_hash
+
+    # Persist tx hash
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE ai_challenges SET tx_hash=$1 WHERE code=$2",
+            tx_hash, code,
+        )
+
+    # NOW fire notifications
+    if challenge.get("isPublic"):
+        asyncio.create_task(
+            notif.notify_public_challenge(
+                code,
+                challenge["topic"],
+                creator_wallet,
+                challenge["stake"],
+                challenge["token"],
+                creator_username=challenge.get("creatorName", ""),
+            )
+        )
+    elif challenge.get("inviteWallet"):
+        asyncio.create_task(
+            notif.notify_friend_invite(
+                code,
+                challenge["topic"],
+                challenge.get("creatorName", creator_wallet[:8]),
+                challenge["inviteWallet"],
+                challenge["stake"],
+                challenge["token"],
+            )
+        )
+
+    return {"success": True}
 
 async def _handle_stake_confirmed(code: str, wallet: str, tx_hash: str) -> None:
     if code not in challenges:
@@ -1565,28 +1700,30 @@ async def _handle_stake_confirmed(code: str, wallet: str, tx_hash: str) -> None:
         await broadcast(code, {"type": "stake_verified", "wallet": wallet})
         return
 
+    FAKE_HASHES = {"auto-sync", "sync-recovery", "pre-lobby-agreed", "", None}
+    is_fake = tx_hash in FAKE_HASHES
+
+    # ── FIX: never trust fake hashes — real verification must come
+    #         through /api/challenge/{code}/sync-stake which checks on-chain ──
+    if is_fake:
+        # Don't mark verified in memory or DB for fake hashes.
+        # The frontend's "Already staked? Sync my stake" button calls /sync-stake
+        # which does the real on-chain check and broadcasts stake_verified itself.
+        logger.info("Ignoring fake tx_hash '%s' for wallet %s — use /sync-stake instead", tx_hash, wallet)
+        return
+
     challenge["players"][wallet]["txVerified"] = True
     challenge["players"][wallet]["txHash"]     = tx_hash
 
-    if tx_hash not in ("auto-sync", "sync-recovery"):
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """UPDATE challenge_players SET tx_hash=$1, tx_verified=TRUE
-                   WHERE challenge_id=(SELECT id FROM ai_challenges WHERE code=$2)
-                     AND wallet_address=$3""",
-                tx_hash, code, wallet,
-            )
-    else:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """UPDATE challenge_players SET tx_verified=TRUE
-                   WHERE challenge_id=(SELECT id FROM ai_challenges WHERE code=$1)
-                     AND wallet_address=$2""",
-                code, wallet,
-            )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE challenge_players SET tx_hash=$1, tx_verified=TRUE
+               WHERE challenge_id=(SELECT id FROM ai_challenges WHERE code=$2)
+                 AND wallet_address=$3""",
+            tx_hash, code, wallet,
+        )
 
     await broadcast(code, {"type": "stake_verified", "wallet": wallet})
-
 
 async def _handle_ready(code: str, wallet: str) -> None:
     if code not in challenges or wallet not in challenges[code]["players"]:
@@ -1660,7 +1797,45 @@ async def notify_socket(ws: WebSocket, wallet: str):
         if ws in sockets:
             sockets.remove(ws)
 
+# ─── In-memory presence set ───────────────────────────────────────────────────
+presence_wallets: set[str] = set()
+presence_sockets: list[WebSocket] = []
 
+async def _broadcast_presence() -> None:
+    online = list(presence_wallets)
+    dead   = []
+    for ws in presence_sockets:
+        try:
+            await ws.send_json({"type": "presence", "online": online})
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        presence_sockets.remove(ws)
+
+
+@app.websocket("/ws/presence")
+async def presence_socket(ws: WebSocket):
+    await ws.accept()
+    presence_sockets.append(ws)
+
+    # Immediately send current online set to the new client
+    await ws.send_json({"type": "presence", "online": list(presence_wallets)})
+
+    wallet = None
+    try:
+        async for msg in ws.iter_json():
+            if msg.get("type") == "hello" and msg.get("wallet"):
+                wallet = msg["wallet"].lower()
+                presence_wallets.add(wallet)
+                # Broadcast updated presence to everyone
+                await _broadcast_presence()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        presence_sockets.remove(ws)
+        if wallet and wallet in presence_wallets:
+            presence_wallets.discard(wallet)
+            await _broadcast_presence()
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
 def _safe_challenge(c: dict) -> dict:

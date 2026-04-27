@@ -102,7 +102,11 @@ class SyncProfileRequest(BaseModel):
     username: str
     avatar_url: Optional[str] = ""
     email: Optional[str] = ""
-
+class ImageUploadResponse(BaseModel):
+    success: bool
+    imageUrl: str
+    message: str
+    
 class NotificationOut(BaseModel):
     id: str
     type: str
