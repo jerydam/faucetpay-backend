@@ -114,7 +114,7 @@ class NotificationService:
                 row["wallet_address"],
                 NType.PUBLIC_CHALLENGE,
                 "🎯 New Public Challenge",
-                f'{display_name} is challenging you on "{topic}" — stake {stake} {token}!',
+                f'{display_name} is challenging your Knowledge on "{topic}" — stake {stake} {token}!',
                 {
                     "code":        code,
                     "topic":       topic,

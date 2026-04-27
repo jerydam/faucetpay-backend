@@ -19,8 +19,6 @@ from eth_account import Account
 import re
 from pydantic import BaseModel
 
-
-
 logger = logging.getLogger(__name__)
 load_dotenv()
 
