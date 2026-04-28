@@ -1480,6 +1480,8 @@ async def decline_rematch_invite(code: str, body: dict):
 
 @app.websocket("/ws/challenge/{code}")
 async def challenge_socket(ws: WebSocket, code: str):
+    import time as _time
+
     code = code.upper()
     await ws.accept()
     connections.setdefault(code, []).append(ws)
@@ -1500,13 +1502,61 @@ async def challenge_socket(ws: WebSocket, code: str):
             if wallet and not connected_wallet:
                 connected_wallet = wallet
 
-            # ── FIX: mark reconnect so grace timer cancels cleanly ──
             if wallet and wallet in (challenges.get(code, {}).get("players") or {}):
                 if game_state.get(code):
                     game_state[code].pop(f"disconnected_{wallet}", None)
                     game_state[code][f"reconnected_{wallet}"] = True
 
-            if m_type == "stake_confirmed":
+            if m_type == "rejoin":
+                if code in challenges and code in game_state:
+                    challenge = challenges[code]
+                    gs        = game_state[code]
+
+                    if challenge.get("status") == "active":
+                        current_q = gs.get("currentQuestion")
+                        if current_q:
+                            elapsed_ms = int(_time.time() * 1000) - current_q["startedAt"]
+                            time_limit = current_q["data"]["timeLimit"]
+                            time_left  = max(0, time_limit - elapsed_ms / 1000)
+
+                            if time_left > 0:
+                                # Replay current question with original startedAt
+                                # so frontend timer reflects real remaining time
+                                await ws.send_json({
+                                    "type":          "question",
+                                    "roundIndex":    current_q["roundIndex"],
+                                    "questionIndex": current_q["questionIndex"],
+                                    "totalQuestions":current_q["totalQuestions"],
+                                    "round":         current_q["roundName"],
+                                    "startedAt":     current_q["startedAt"],
+                                    "data": {
+                                        "question":  current_q["data"]["question"],
+                                        "options":   current_q["data"]["options"],
+                                        "timeLimit": time_limit,
+                                    },
+                                })
+                            else:
+                                # Between questions — send scores so UI isn't blank
+                                await ws.send_json({
+                                    "type":      "state_sync",
+                                    "challenge": _safe_challenge(challenge),
+                                    "totalScores": {
+                                        w: p["points"]
+                                        for w, p in challenge["players"].items()
+                                    },
+                                })
+                        else:
+                            # currentQuestion is None — between questions or round transition
+                            await ws.send_json({
+                                "type":      "state_sync",
+                                "challenge": _safe_challenge(challenge),
+                                "totalScores": {
+                                    w: p["points"]
+                                    for w, p in challenge["players"].items()
+                                },
+                            })
+
+            elif m_type == "stake_confirmed":
                 await _handle_stake_confirmed(code, wallet, msg.get("txHash", ""))
             elif m_type == "ready":
                 await _handle_ready(code, wallet)
@@ -1547,7 +1597,6 @@ async def challenge_socket(ws: WebSocket, code: str):
                 asyncio.create_task(
                     _disconnect_grace(code, connected_wallet, username)
                 )
-
 
 GRACE_SECONDS = 60
 

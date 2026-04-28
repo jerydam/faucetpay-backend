@@ -321,25 +321,19 @@ async def run_game_loop(
     game_state: Dict[str, dict],
     pool:       asyncpg.Pool,
     broadcast:  BroadcastFn,
-    notif:      "NotificationService",   # ← add this
+    notif:      "NotificationService",
 ) -> None:
-    """
-    Drives a full match:
-      1. Countdown
-      2. Loop rounds → questions → collect answers → score → reveal
-      3. Determine winner, persist to DB, resolve on-chain, notify players
-    """
+    import time as _time
+
     challenge = challenges[code]
     state     = game_state[code]
 
     challenge["status"] = "active"
     await _mark_started(pool, code)
 
-    # ── Pre-game countdown ────────────────────────────────────────────────────
     await broadcast(code, {"type": "game_start", "message": "Challenge starting in 3…"})
     await asyncio.sleep(3)
 
-    # ── Rounds ───────────────────────────────────────────────────────────────
     rounds = challenge["rounds"]
 
     for r_idx, rnd in enumerate(rounds):
@@ -353,23 +347,31 @@ async def run_game_loop(
         await asyncio.sleep(3)
 
         for q_idx, q in enumerate(rnd["questions"]):
-            # Send question WITHOUT the correct answer
-            await broadcast(code, {
-                "type":           "question",
+            # ── Store before broadcast so rejoin handler always finds it ──
+            current_q_payload = {
                 "roundIndex":     r_idx,
                 "questionIndex":  q_idx,
                 "totalQuestions": len(rnd["questions"]),
+                "roundName":      rnd["type"],
+                "startedAt":      int(_time.time() * 1000),
                 "data": {
                     "question":  q["question"],
                     "options":   q["options"],
                     "timeLimit": rnd["timeLimit"],
                 },
+            }
+            state["currentQuestion"] = current_q_payload
+
+            await broadcast(code, {
+                "type": "question",
+                **current_q_payload,
             })
 
-            # Wait for the time window
             await asyncio.sleep(rnd["timeLimit"])
 
-            # ── Score this question ───────────────────────────────────────
+            # ── Clear so rejoin after question_end doesn't replay stale question ──
+            state["currentQuestion"] = None
+
             ans_key       = f"{r_idx}_{q_idx}"
             round_answers = state["answers"].get(ans_key, {})
             q_scores: Dict[str, int] = {}
@@ -379,10 +381,9 @@ async def run_game_loop(
                 pts = calc_points(ans["timeTaken"], rnd["timeLimit"]) if correct else 0
                 challenge["players"][wallet]["points"] += pts
                 q_scores[wallet] = pts
-                # fire-and-forget — never block the game loop on a DB write
                 asyncio.create_task(
                     _save_answer(pool, code, wallet, r_idx, q_idx,
-                                ans["answerId"], correct, ans["timeTaken"], pts)
+                                 ans["answerId"], correct, ans["timeTaken"], pts)
                 )
 
             await broadcast(code, {
@@ -396,18 +397,16 @@ async def run_game_loop(
                     for w, p in challenge["players"].items()
                 },
             })
-            await asyncio.sleep(3)   # brief pause before next question
+            await asyncio.sleep(3)
 
-        # ── End-of-round summary ──────────────────────────────────────────
         await broadcast(code, {
-            "type":      "round_end",
+            "type":       "round_end",
             "roundIndex": r_idx,
             "roundType":  rnd["type"],
-            "scores":    {w: p["points"] for w, p in challenge["players"].items()},
+            "scores":     {w: p["points"] for w, p in challenge["players"].items()},
         })
         await asyncio.sleep(4)
 
-    # ── Determine Winner ──────────────────────────────────────────────────────
     players = challenge["players"]
     scores  = {w: p["points"] for w, p in players.items()}
     wallets = list(scores.keys())
@@ -422,15 +421,11 @@ async def run_game_loop(
     challenge["status"] = "finished"
     challenge["winner"] = winner
 
-    # ── Persist result to DB ──────────────────────────────────────────────────
     await _mark_finished(pool, code, winner)
 
-    # ── Resolve on-chain (non-blocking — errors are logged, not raised) ───────
     if outcome == "winner" and winner:
-        # setWinner → winner can now call claimReward() from the frontend
         asyncio.create_task(_set_winner_on_chain(code, winner))
     else:
-        # Tie → refundQuiz → both players can call emergencyRefund() from the frontend
         asyncio.create_task(_refund_quiz_on_chain(code))
 
     stake = challenge.get("stakeAmount", 0)
@@ -438,10 +433,8 @@ async def run_game_loop(
 
     if outcome == "winner" and winner:
         loser = next(w for w in wallets if w != winner)
-        # Persists to DB inbox AND pushes live if connected
         await notif.notify_game_over(code, winner, loser, stake, token)
     else:
-        # Tie — notify both
         for wallet in wallets:
             await notif.send(
                 wallet,
@@ -451,8 +444,7 @@ async def run_game_loop(
                 {"code": code},
             )
 
-    # WebSocket broadcast for the live game UI (keep this too)
-    final_payload = {
+    await broadcast(code, {
         "type":    "game_over",
         "outcome": outcome,
         "winner":  winner,
@@ -464,10 +456,8 @@ async def run_game_loop(
             for w in wallets
         },
         "canRematch": True,
-    }
-    await broadcast(code, final_payload)
+    })
     logger.info("Game %s finished. Winner: %s", code, winner or "TIE")
-
 
 # ─── DB Helpers ───────────────────────────────────────────────────────────────
 
