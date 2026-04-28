@@ -99,8 +99,8 @@ async def startup():
 
     pool = await asyncpg.create_pool(
         dsn=db_url,
-        min_size=1,
-        max_size=5,
+        min_size=5,
+        max_size=15,
         statement_cache_size=0,
         ssl="require",
         timeout=30,

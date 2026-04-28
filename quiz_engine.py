@@ -376,13 +376,13 @@ async def run_game_loop(
 
             for wallet, ans in round_answers.items():
                 correct = ans["answerId"] == q["correctId"]
-                pts     = calc_points(ans["timeTaken"], rnd["timeLimit"]) if correct else 0
+                pts = calc_points(ans["timeTaken"], rnd["timeLimit"]) if correct else 0
                 challenge["players"][wallet]["points"] += pts
                 q_scores[wallet] = pts
-
-                await _save_answer(
-                    pool, code, wallet, r_idx, q_idx,
-                    ans["answerId"], correct, ans["timeTaken"], pts,
+                # fire-and-forget — never block the game loop on a DB write
+                asyncio.create_task(
+                    _save_answer(pool, code, wallet, r_idx, q_idx,
+                                ans["answerId"], correct, ans["timeTaken"], pts)
                 )
 
             await broadcast(code, {
