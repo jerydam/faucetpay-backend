@@ -493,7 +493,6 @@ async def _mark_finished(pool: asyncpg.Pool, code: str, winner: str | None) -> N
                WHERE code=$2""",
             winner, code,
         )
-        # Increment total_duels for ALL players — COALESCE guards against NULL
         await conn.execute(
             """UPDATE players SET total_duels = COALESCE(total_duels, 0) + 1
                WHERE wallet_address IN (
@@ -519,7 +518,21 @@ async def _mark_finished(pool: asyncpg.Pool, code: str, winner: str | None) -> N
                    )""",
                 code, winner,
             )
-            
+
+    # ── NEW: persist each player's final score from challenge_answers ──
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE challenge_players cp
+               SET final_points = COALESCE((
+                   SELECT SUM(ca.points_awarded)
+                   FROM challenge_answers ca
+                   WHERE ca.challenge_id = cp.challenge_id
+                     AND ca.wallet_address = cp.wallet_address
+               ), 0)
+               WHERE cp.challenge_id = (SELECT id FROM ai_challenges WHERE code = $1)""",
+            code,
+        )
+          
 async def _save_answer(
     pool:       asyncpg.Pool,
     code:       str,

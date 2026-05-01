@@ -301,7 +301,7 @@ async def create_challenge(body: CreateChallengeRequest):
         )
 
     # 2. Generate questions via AI
-    questions_data = await generate_questions(body.topic)
+        questions_data = await generate_questions(body.topic, total_count=body.questionCount)
 
     # 3. Create challenge record
     code         = make_code()
@@ -1256,11 +1256,12 @@ async def get_challenge(code: str):
             raise HTTPException(status_code=404, detail="Challenge not found")
 
         d = dict(row)
-        d["stake"]    = float(d.get("stake_amount", 0))
-        d["token"]    = d.get("token_symbol", "")
-        d["chainId"]  = d.get("chain_id")
-        d["isPublic"] = d.get("is_public")
-        d["creator"]  = d.get("creator_address", "")
+        d["stake"]          = float(d.get("stake_amount", 0))
+        d["token"]          = d.get("token_symbol", "")
+        d["chainId"]        = d.get("chain_id")
+        d["isPublic"]       = d.get("is_public")
+        d["creator"]        = d.get("creator_address", "")
+        d["winner_address"] = d.get("winner_address")   # ← expose winner
 
         creator_row = await conn.fetchrow(
             "SELECT username FROM players WHERE wallet_address=$1", d["creator"]
@@ -1268,14 +1269,16 @@ async def get_challenge(code: str):
         d["creatorName"] = creator_row["username"] if creator_row else d["creator"][:8]
 
         player_rows = await conn.fetch(
-            """SELECT wallet_address, username, tx_verified, ready
-               FROM challenge_players WHERE challenge_id=$1""",
+            """SELECT wallet_address, username, tx_verified, ready,
+                      COALESCE(final_points, 0) AS points
+               FROM challenge_players
+               WHERE challenge_id=$1""",
             d["id"],
         )
         d["players"] = {
             r["wallet_address"]: {
                 "username":   r["username"],
-                "points":     0,
+                "points":     r["points"],     # ← real score now
                 "ready":      r["ready"],
                 "txVerified": r["tx_verified"],
             }

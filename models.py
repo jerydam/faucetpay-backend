@@ -14,7 +14,7 @@ class CreateChallengeRequest(BaseModel):
     chainId: int
     isPublic: bool = True
     inviteWallet: Optional[str] = None  # if set → private friend invite
-
+    questionCount: int = 15   
 
 class JoinChallengeRequest(BaseModel):
     walletAddress: str
