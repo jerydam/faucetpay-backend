@@ -27,6 +27,15 @@ class NType:
     REWARD_AVAILABLE = "reward_available"
 
 
+# ── Rate limit table ──────────────────────────────────────────────────────────
+# (max_count, window_minutes) per notification type
+_RATE_LIMITS: dict[str, tuple[int, int]] = {
+    NType.PUBLIC_CHALLENGE: (2, 5),    # max 2 public challenge pings per 5 min
+    NType.REMATCH_REQUEST:  (1, 2),    # max 1 rematch ping per 2 min
+    NType.CHALLENGE_INVITE: (2, 10),   # max 2 direct invites per 10 min
+}
+
+
 class NotificationService:
     def __init__(
         self,
@@ -48,6 +57,25 @@ class NotificationService:
     ) -> str:
         """Persist notification + push to live socket if connected. Returns notif id."""
         recipient = recipient.lower()
+
+        # ── Per-type rate limiting ────────────────────────────────────────────
+        if type_ in _RATE_LIMITS:
+            max_count, window_minutes = _RATE_LIMITS[type_]
+            async with self.pool.acquire() as conn:
+                recent = await conn.fetchval(
+                    """SELECT COUNT(*) FROM notifications
+                       WHERE recipient_wallet = $1
+                         AND type            = $2
+                         AND created_at      > NOW() - ($3 || ' minutes')::interval""",
+                    recipient, type_, str(window_minutes),
+                )
+            if recent >= max_count:
+                logger.info(
+                    "Rate limit hit — skipping: type=%s recipient=%s "
+                    "(already %d in last %d min)",
+                    type_, recipient, recent, window_minutes,
+                )
+                return ""   # silently drop — already persisted enough
 
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -100,7 +128,19 @@ class NotificationService:
 
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT wallet_address FROM players WHERE wallet_address != $1",
+                """
+                SELECT p.wallet_address FROM players p
+                WHERE p.wallet_address != $1
+                  AND p.last_seen_at > NOW() - INTERVAL '10 minutes'
+                  AND p.wallet_address NOT IN (
+                      SELECT recipient_wallet FROM notifications
+                      WHERE type        = 'public_challenge'
+                        AND created_at  > NOW() - INTERVAL '10 minutes'
+                      GROUP BY recipient_wallet
+                      HAVING COUNT(*) >= 3
+                  )
+                LIMIT 100
+                """,
                 creator.lower(),
             )
 
@@ -247,7 +287,10 @@ class NotificationService:
 
     async def _push(self, wallet: str, payload: dict) -> None:
         sockets = self.conns.get(wallet, [])
-        dead    = []
+        if not sockets:
+            return      # nobody online — already persisted to DB, nothing to push
+
+        dead = []
         for ws in sockets:
             try:
                 await ws.send_json(payload)
@@ -256,9 +299,13 @@ class NotificationService:
         for ws in dead:
             sockets.remove(ws)
 
+        # Clean up empty list so the dict doesn't grow unboundedly
+        if not sockets:
+            self.conns.pop(wallet, None)
+
 
 def _row_to_dict(row) -> dict:
-    d          = dict(row)
+    d              = dict(row)
     d["id"]        = str(d["id"])
     d["createdAt"] = d.pop("created_at").isoformat()
     d["isRead"]    = d.pop("is_read")

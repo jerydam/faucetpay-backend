@@ -269,7 +269,19 @@ async def send_targeted_counter(code: str, body: dict):
     if offer and offer.get("accepted"):
         raise HTTPException(status_code=400, detail="Stake already agreed")
 
-    # Resolve creator display name (fall back to passed name, then truncated wallet)
+    # ── Cooldown: prevent spamming counters at the same target ───────────────
+    last_counter_key = f"last_counter_{creator_wallet}_{target_wallet}"
+    last_sent = challenge.get(last_counter_key)
+    if last_sent:
+        elapsed = (datetime.datetime.utcnow() - last_sent).total_seconds()
+        if elapsed < 10:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Wait {int(10 - elapsed)}s before sending another counter to this player",
+            )
+    challenge[last_counter_key] = datetime.datetime.utcnow()
+
+    # Resolve creator display name
     if not creator_name:
         creator_name = (
             challenge.get("creatorName")
@@ -277,36 +289,39 @@ async def send_targeted_counter(code: str, body: dict):
             or creator_wallet[:8]
         )
 
-    # Broadcast the counter — every socket in this room receives it,
-    # but the frontend only shows the banner to the wallet matching targetWallet.
     await broadcast(code, {
         "type":         "pre_lobby_counter",
         "fromWallet":   creator_wallet,
         "fromName":     creator_name,
         "amount":       amount,
         "sentAt":       datetime.datetime.utcnow().isoformat(),
-        "targetWallet": target_wallet,   # <-- always set, never null
+        "targetWallet": target_wallet,
     })
 
     return {"success": True, "amount": amount, "targetWallet": target_wallet}
 
+
 @app.post("/api/challenge/create")
 async def create_challenge(body: CreateChallengeRequest):
-    # 1. Ensure player exists
+    creator_low = body.creatorAddress.lower()
+
+    # 1. Ensure player exists + update last_seen_at
     async with pool.acquire() as conn:
         await conn.execute(
-            """INSERT INTO players (wallet_address, username)
-               VALUES ($1, $2) ON CONFLICT DO NOTHING""",
-            body.creatorAddress.lower(), body.creatorUsername,
+            """INSERT INTO players (wallet_address, username, last_seen_at)
+               VALUES ($1, $2, NOW())
+               ON CONFLICT (wallet_address)
+               DO UPDATE SET username=EXCLUDED.username, last_seen_at=NOW()""",
+            creator_low, body.creatorUsername,
         )
 
     # 2. Generate questions via AI
+    async with pool.acquire() as conn:
         questions_data = await generate_questions(body.topic, total_count=body.questionCount)
 
     # 3. Create challenge record
     code         = make_code()
     challenge_id = str(uuid.uuid4())
-    creator_low  = body.creatorAddress.lower()
 
     challenge_obj = {
         "id":          challenge_id,
@@ -349,7 +364,6 @@ async def create_challenge(body: CreateChallengeRequest):
     game_state[code] = {"answers": {}}
 
     return {"success": True, "code": code, "challenge": _safe_challenge(challenge_obj)}
-
 
 # ─── Stake Offer Endpoints ────────────────────────────────────────────────────
 
@@ -880,13 +894,16 @@ async def join_challenge(code: str, body: JoinChallengeRequest):
     if joiner in challenge["players"]:
         return {"success": True, "challenge": _safe_challenge(challenge)}
 
-    # ── FIX: only mark tx_verified if it's a real on-chain hash ──
     FAKE_HASHES = {"pre-lobby-agreed", "sync-recovery", "auto-sync", "", None}
     tx_verified = body.txHash not in FAKE_HASHES
 
     async with pool.acquire() as conn:
+        # Upsert player + update last_seen_at in one shot
         await conn.execute(
-            "INSERT INTO players (wallet_address, username) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+            """INSERT INTO players (wallet_address, username, last_seen_at)
+               VALUES ($1, $2, NOW())
+               ON CONFLICT (wallet_address)
+               DO UPDATE SET last_seen_at=NOW()""",
             joiner, body.username,
         )
         await conn.execute(
@@ -902,7 +919,7 @@ async def join_challenge(code: str, body: JoinChallengeRequest):
         "username":   body.username,
         "points":     0,
         "ready":      False,
-        "txVerified": tx_verified,   # ← was hardcoded True
+        "txVerified": tx_verified,
     }
 
     asyncio.create_task(
@@ -950,6 +967,19 @@ async def send_rematch_invite(code: str, body: dict):
     if requester not in players:
         raise HTTPException(status_code=403, detail="You were not part of this challenge")
 
+    # ── Cooldown: prevent hammering rematch invites ───────────────────────────
+    last_rematch_key = f"last_rematch_{requester}"
+    last_sent = challenges.get(code, {}).get(last_rematch_key)
+    if last_sent:
+        elapsed = (datetime.datetime.utcnow() - last_sent).total_seconds()
+        if elapsed < 30:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Wait {int(30 - elapsed)}s before sending another rematch invite",
+            )
+    if code in challenges:
+        challenges[code][last_rematch_key] = datetime.datetime.utcnow()
+
     requester_name  = players[requester]
     opponent_wallet = next((w for w in players if w != requester), None)
     if not opponent_wallet:
@@ -965,11 +995,8 @@ async def send_rematch_invite(code: str, body: dict):
         "requesterName":   requester_name,
     })
 
-    # ── Schedule timeout broadcast after 30 seconds ──
     async def _rematch_timeout():
         await asyncio.sleep(30)
-        # Only fire timeout if the rematch was never accepted
-        # (check if a new challenge was created from this code)
         already_rematched = any(
             c.get("rematch_of") == code or
             challenges.get(c_code, {}).get("rematch_of") == code
@@ -984,8 +1011,7 @@ async def send_rematch_invite(code: str, body: dict):
 
     asyncio.create_task(_rematch_timeout())
 
-    return {"success": True, "opponentWallet": opponent_wallet}    
- 
+    return {"success": True, "opponentWallet": opponent_wallet}
  
 # ── STEP 2: Opponent accepts invite ──────────────────────────────────────────
  
@@ -1830,6 +1856,16 @@ async def notify_socket(ws: WebSocket, wallet: str):
     await ws.accept()
     notify_conn.setdefault(wallet, []).append(ws)
 
+    # ── Mark player as recently active ───────────────────────────────────────
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE players SET last_seen_at=NOW() WHERE wallet_address=$1",
+                wallet,
+            )
+    except Exception as e:
+        logger.warning("Could not update last_seen_at for %s: %s", wallet, e)
+
     try:
         count = await notif.unread_count(wallet)
         await ws.send_json({"type": "unread_count", "count": count})
@@ -1846,7 +1882,9 @@ async def notify_socket(ws: WebSocket, wallet: str):
         sockets = notify_conn.get(wallet, [])
         if ws in sockets:
             sockets.remove(ws)
-
+        if not sockets:
+            notify_conn.pop(wallet, None)   # clean up empty list
+            
 # ─── In-memory presence set ───────────────────────────────────────────────────
 presence_wallets: set[str] = set()
 presence_sockets: list[WebSocket] = []
