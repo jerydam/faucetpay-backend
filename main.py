@@ -316,12 +316,13 @@ async def create_challenge(body: CreateChallengeRequest):
         )
 
     # 2. Generate questions via AI
-    async with pool.acquire() as conn:
-        questions_data = await generate_questions(body.topic, total_count=body.questionCount)
+    questions_data = await generate_questions(body.topic, total_count=body.questionCount)
 
     # 3. Create challenge record
     code         = make_code()
     challenge_id = str(uuid.uuid4())
+
+    invite_low = body.inviteWallet.lower() if body.inviteWallet else None
 
     challenge_obj = {
         "id":          challenge_id,
@@ -335,6 +336,9 @@ async def create_challenge(body: CreateChallengeRequest):
         "rounds":      questions_data["rounds"],
         "status":      "waiting",
         "isPublic":    body.isPublic,
+        "inviteWallet": invite_low,
+        "stakeAmount": body.stakeAmount,
+        "tokenSymbol": body.tokenSymbol,
         "players": {
             creator_low: {
                 "username":   body.creatorUsername,
@@ -348,11 +352,11 @@ async def create_challenge(body: CreateChallengeRequest):
     async with pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO ai_challenges
-               (id, code, creator_address, topic, stake_amount, token_symbol, chain_id, status, is_public, rounds_data)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+               (id, code, creator_address, topic, stake_amount, token_symbol, chain_id, status, is_public, rounds_data, invite_wallet)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
             challenge_id, code, creator_low, body.topic, body.stakeAmount,
             body.tokenSymbol, body.chainId, "waiting", body.isPublic,
-            json.dumps(questions_data),
+            json.dumps(questions_data), invite_low,
         )
         await conn.execute(
             """INSERT INTO challenge_players (challenge_id, wallet_address, username, ready)
@@ -363,7 +367,29 @@ async def create_challenge(body: CreateChallengeRequest):
     challenges[code] = challenge_obj
     game_state[code] = {"answers": {}}
 
+    # 4. Notify opponent if this is a private challenge
+    if not body.isPublic and invite_low:
+        try:
+            await notif.send(
+                invite_low,
+                "challenge_invite",
+                f"⚔️ {body.creatorUsername} challenged you!",
+                f"Topic: {body.topic} · Stake: {body.stakeAmount} {body.tokenSymbol}. Tap to accept.",
+                {
+                    "code":            code,
+                    "creatorUsername": body.creatorUsername,
+                    "creatorWallet":   creator_low,
+                    "stakeAmount":     body.stakeAmount,
+                    "tokenSymbol":     body.tokenSymbol,
+                    "topic":           body.topic,
+                },
+            )
+        except Exception as e:
+            # Non-fatal — challenge is created regardless
+            logger.warning("Failed to notify opponent %s: %s", invite_low, e)
+
     return {"success": True, "code": code, "challenge": _safe_challenge(challenge_obj)}
+
 
 # ─── Stake Offer Endpoints ────────────────────────────────────────────────────
 
