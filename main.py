@@ -2,7 +2,7 @@ from __future__ import annotations
 import os, json, random, string, asyncio, logging, uuid
 from typing import Dict, List, Optional
 import datetime
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect,UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from web3 import Web3
@@ -11,8 +11,10 @@ import asyncpg
 from supabase import create_client, Client
 from models import (
     CheckAvailabilityRequest, CreateChallengeRequest, JoinChallengeRequest,
-    RematachRequest, ClaimRequest, UpdateProfileRequest, UserProfile, SyncProfileRequest, StakeOfferRequest
+    RematachRequest, ClaimRequest, UpdateProfileRequest, UserProfile, SyncProfileRequest,
+    StakeOfferRequest, EmployeeCreate, Employee, VerifyRequest
 )
+from datetime import datetime, timedelta
 from quiz_engine import (_mark_finished, _set_winner_on_chain)
 from abi import QUIZ_HUB_ABI
 from eth_account import Account
@@ -51,7 +53,7 @@ BACKEND_ADDRESS = os.getenv("BACKEND_ADDRESS")        # fixed typo: was BACKEN_A
 PRIVATE_KEY     = os.getenv("RESOLVER_PRIVATE_KEY")
 CONTRACT_ADDRESS = os.getenv("QUIZ_HUB_CONTRACT")
 DATABASE_URL     = os.getenv("DATABASE_URL")
-
+STORAGE_BUCKET = "employee-photos" 
 RPC_URLS = {
     42220: "https://forno.celo.org",
     8453:  "https://mainnet.base.org",
@@ -86,7 +88,14 @@ def make_code(k: int = 6) -> str:
 def checksum(addr: str) -> str:
     return Web3.to_checksum_address(addr) if addr else addr
 
-
+def generate_unique_id():
+    while True:
+        num = str(random.randint(0, 999)).zfill(3)
+        new_id = f"FD{num}"
+        response = supabase.table("employees").select("id").eq("id", new_id).execute()
+        if not response.data:
+            return new_id
+        
 # ─── Lifecycle ────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -232,8 +241,6 @@ async def get_player(wallet: str):
 
 
 # ─── Challenge Endpoints ──────────────────────────────────────────────────────
-# ─── ADD THIS ENDPOINT to main.py, alongside the other stake-offer endpoints ───
-# Place it after /api/challenge/{code}/pre-lobby-accept
 
 @app.post("/api/challenge/{code}/counter")
 async def send_targeted_counter(code: str, body: dict):
@@ -300,7 +307,84 @@ async def send_targeted_counter(code: str, body: dict):
 
     return {"success": True, "amount": amount, "targetWallet": target_wallet}
 
-
+@app.post("/register", response_model=Employee)
+async def register_employee(
+    name: str = Form(...),
+    role: str = Form(...),
+    photo: UploadFile = File(None),
+):
+    emp_id = generate_unique_id()
+    issue_date = datetime.now()
+    expiry_date = issue_date + timedelta(days=365 * 7)
+ 
+    photo_url = None
+ 
+    # Upload photo to Supabase Storage if provided
+    if photo and photo.filename:
+        try:
+            file_ext = photo.filename.split(".")[-1].lower()
+            allowed = {"jpg", "jpeg", "png", "webp", "gif"}
+            if file_ext not in allowed:
+                raise HTTPException(status_code=400, detail="Invalid image format. Use JPG, PNG, WEBP, or GIF.")
+ 
+            file_bytes = await photo.read()
+            storage_path = f"{emp_id}/{uuid.uuid4()}.{file_ext}"
+ 
+            supabase.storage.from_(STORAGE_BUCKET).upload(
+                storage_path,
+                file_bytes,
+                {"content-type": photo.content_type or f"image/{file_ext}"},
+            )
+ 
+            # Get public URL
+            public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(storage_path)
+            photo_url = public_url
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Non-fatal: register without photo
+            print(f"[WARN] Photo upload failed: {e}")
+ 
+    employee_data = {
+        "id": emp_id,
+        "name": name,
+        "role": role,
+        "issue_date": issue_date.strftime("%d/%m/%Y"),
+        "expiry_date": expiry_date.strftime("%d/%m/%Y"),
+        "photo_url": photo_url,
+    }
+ 
+    try:
+        response = supabase.table("employees").insert(employee_data).execute()
+        return response.data[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+ 
+ 
+@app.post("/verify")
+def verify_employee(qr_data: VerifyRequest):
+    try:
+        response = supabase.table("employees").select("*").eq("id", qr_data.id).execute()
+ 
+        if not response.data:
+            return {"valid": False, "employee": None}
+ 
+        emp_record = response.data[0]
+ 
+        is_valid = (
+            emp_record["name"] == qr_data.name and
+            emp_record["role"] == qr_data.role
+        )
+ 
+        # Return full record so frontend can show photo etc.
+        return {
+            "valid": is_valid,
+            "employee": emp_record if is_valid else None,
+        }
+ 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+     
 @app.post("/api/challenge/create")
 async def create_challenge(body: CreateChallengeRequest):
     creator_low = body.creatorAddress.lower()

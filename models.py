@@ -141,3 +141,20 @@ class CheckAvailabilityRequest(BaseModel):
     field:          str    # only "username" is enforced
     value:          str
     current_wallet: str
+
+class EmployeeCreate(BaseModel):
+    name: str
+    role: str
+
+class Employee(BaseModel):
+    id: str
+    name: str
+    role: str
+    issue_date: str
+    expiry_date: str
+    photo_url: str | None = None
+ 
+class VerifyRequest(BaseModel):
+    id: str
+    name: str
+    role: str
